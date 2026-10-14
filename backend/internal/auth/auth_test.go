@@ -166,8 +166,11 @@ func TestHashQueueBoundedAndCancellable(t *testing.T) {
 // all pass Acquire before any of them fails.
 func TestFailureLimiterCountsInflight(t *testing.T) {
 	l := NewFailureLimiter(2, time.Hour)
-	if !l.Acquire("k") || !l.Acquire("k") {
-		t.Fatal("first two attempts refused")
+	if !l.Acquire("k") {
+		t.Fatal("first attempt refused")
+	}
+	if !l.Acquire("k") {
+		t.Fatal("second attempt refused")
 	}
 	if l.Acquire("k") {
 		t.Fatal("third concurrent attempt allowed")

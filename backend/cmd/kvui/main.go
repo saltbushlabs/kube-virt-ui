@@ -208,7 +208,9 @@ func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
 	go func() {
 		defer close(done)
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		// WithoutCancel: the shutdown deadline runs from now, after ctx has
+		// already ended, so it cannot be derived from ctx itself.
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdown); err != nil {
 			slog.Error("shutdown", "err", err)

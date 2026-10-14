@@ -52,19 +52,18 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 	// going round again, so the clients returned always match a
 	// membership read taken after the last provisioning. The loop only
 	// repeats while an admin keeps changing the role mid-request.
-	var m store.Membership
+	m, err := s.Store.Membership(r.Context(), u.ID, ns)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusForbidden, "not a member of this namespace")
+		return userClients{}, false
+	}
+	if err != nil {
+		internalError(w, r, err)
+		return userClients{}, false
+	}
 	var cfg *rest.Config
 	for {
 		var err error
-		m, err = s.Store.Membership(r.Context(), u.ID, ns)
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusForbidden, "not a member of this namespace")
-			return userClients{}, false
-		}
-		if err != nil {
-			internalError(w, r, err)
-			return userClients{}, false
-		}
 		cfg, err = s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
 		if errors.Is(err, tenant.ErrNotTenant) {
 			writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
@@ -91,6 +90,7 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 		if m2.Role == m.Role {
 			break
 		}
+		m = m2 // apply the role just read instead of reading a third time
 	}
 	kube, err := kubernetes.NewForConfig(cfg)
 	if err != nil {

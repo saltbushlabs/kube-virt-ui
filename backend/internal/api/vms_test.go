@@ -7,8 +7,15 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 
 	"kvui/internal/store"
 )
@@ -233,6 +240,92 @@ func TestWatchVMsEndsOnCloseStreams(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("watch stream stayed open after CloseStreams")
+	}
+}
+
+// A membership deleted while a request is re-provisioning (fault-injected
+// here by deleting the row inside Ensure's RoleBinding delete) must refuse
+// the request and remove the just-recreated ServiceAccount/RoleBinding.
+func TestClientsForUndoesProvisioningAfterRemoval(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, link, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	alice := e.client()
+	e.redeem(alice, link, "alice") // user 1, provisioned as operator
+
+	// Queue a role change so the next request re-runs Ensure, and delete
+	// the membership row in the middle of it (the RoleBinding delete).
+	if err := e.store.UpsertMembership(ctx, store.Membership{UserID: 1, Namespace: "team-a", Role: "owner"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var injected atomic.Bool
+	e.k8s.PrependReactor("delete", "rolebindings", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if injected.CompareAndSwap(false, true) {
+			_ = e.store.DeleteMembership(ctx, 1, "team-a")
+		}
+		return false, nil, nil // let the delete proceed
+	})
+
+	if st := e.do(alice, "GET", "/api/namespaces/team-a/vms", nil, nil); st != 403 {
+		t.Fatalf("request for removed membership: %d", st)
+	}
+	if !injected.Load() {
+		t.Fatal("fault was never injected; Ensure did not run")
+	}
+	if _, err := e.k8s.CoreV1().ServiceAccounts("team-a").Get(ctx, "kvui-u1", metav1.GetOptions{}); err == nil {
+		t.Fatal("serviceaccount resurrected for removed membership")
+	}
+	if _, err := e.k8s.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u1", metav1.GetOptions{}); err == nil {
+		t.Fatal("rolebinding resurrected for removed membership")
+	}
+}
+
+// The admin removal path removes the Kubernetes objects again after
+// deleting the row, so a ServiceAccount/RoleBinding recreated by a racing
+// request in between (fault-injected here at the first ServiceAccount
+// delete) does not survive.
+func TestAdminDeleteMembershipRemovesRecreated(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, adminLink, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		MakeAdmin: true, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	admin := e.client()
+	e.redeem(admin, adminLink, "root")
+	_, link, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	e.redeem(e.client(), link, "alice") // user 2
+
+	saGVR := corev1.SchemeGroupVersion.WithResource("serviceaccounts")
+	var recreated atomic.Bool
+	e.k8s.PrependReactor("delete", "serviceaccounts", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.GetNamespace() != "team-a" || !recreated.CompareAndSwap(false, true) {
+			return false, nil, nil
+		}
+		// Perform the delete, then simulate a racing Ensure recreating
+		// both objects before the membership row is deleted.
+		if err := e.k8s.Tracker().Delete(saGVR, "team-a", "kvui-u2"); err != nil {
+			return true, nil, err
+		}
+		meta := metav1.ObjectMeta{Name: "kvui-u2", Namespace: "team-a"}
+		if err := e.k8s.Tracker().Add(&corev1.ServiceAccount{ObjectMeta: meta}); err != nil {
+			return true, nil, err
+		}
+		err := e.k8s.Tracker().Add(&rbacv1.RoleBinding{ObjectMeta: meta})
+		return true, nil, err
+	})
+
+	if st := e.do(admin, "DELETE", "/api/admin/users/2/memberships/team-a", nil, nil); st != 204 {
+		t.Fatalf("remove membership: %d", st)
+	}
+	if !recreated.Load() {
+		t.Fatal("fault was never injected; ServiceAccount was not deleted")
+	}
+	if _, err := e.k8s.CoreV1().ServiceAccounts("team-a").Get(ctx, "kvui-u2", metav1.GetOptions{}); err == nil {
+		t.Fatal("recreated serviceaccount survived membership removal")
+	}
+	if _, err := e.k8s.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u2", metav1.GetOptions{}); err == nil {
+		t.Fatal("recreated rolebinding survived membership removal")
 	}
 }
 

@@ -255,6 +255,10 @@ func (p *UploadProxy) Upload(ctx context.Context, dyn dynamic.Interface, namespa
 	if err != nil {
 		return err
 	}
+	// The client and its Transport are built per upload (the CA bundle is
+	// re-read each time); drop its idle connection instead of leaving it
+	// and its goroutines open against the upload proxy.
+	defer client.CloseIdleConnections()
 	// CDI marks an image UploadReady when its upload server pod starts,
 	// a moment before the server accepts connections, so the proxy can
 	// briefly answer 502/503. With Expect: 100-continue it does so before

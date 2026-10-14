@@ -81,14 +81,16 @@ export function CreateVMPage() {
   const [sizeMode, setSizeMode] = useState<'instancetype' | 'custom'>('instancetype')
   const [instancetype, setInstancetype] = useState('')
   const [cpus, setCpus] = useState(2)
-  const [memory, setMemory] = useState(4)
+  // Memory and disk size are kept as text so the field can be emptied
+  // while typing instead of snapping back to 0.
+  const [memory, setMemory] = useState('4')
   const [memoryUnit, setMemoryUnit] = useState<'Gi' | 'Mi'>('Gi')
   const [preference, setPreference] = useState('')
   const [diskSource, setDiskSource] = useState<DiskSource>('registry')
   const [diskUrl, setDiskUrl] = useState('')
   const [image, setImage] = useState('')
   const [cdrom, setCdrom] = useState('')
-  const [diskSize, setDiskSize] = useState(20)
+  const [diskSize, setDiskSize] = useState('20')
   const [storageClass, setStorageClass] = useState('')
   const [sshKeys, setSshKeys] = useState('')
   const [userData, setUserData] = useState('')
@@ -107,6 +109,16 @@ export function CreateVMPage() {
 
   async function submit(e: FormEvent) {
     e.preventDefault()
+    // The size fields are text so they can be emptied while typing; make
+    // sure they hold a positive number before building "Gi"/"Mi" strings.
+    if (persistent && !(Number(diskSize) > 0)) {
+      setError('Enter a disk size')
+      return
+    }
+    if (sizeMode === 'custom' && !(Number(memory) > 0)) {
+      setError('Enter a memory size')
+      return
+    }
     const req: CreateVMRequest = {
       name,
       diskSource,
@@ -219,7 +231,7 @@ export function CreateVMPage() {
                   <FlexItem>
                     <FormGroup label="Memory" fieldId="memory">
                       <Flex spaceItems={{ default: 'spaceItemsSm' }} flexWrap={{ default: 'nowrap' }}>
-                        <TextInput id="memory" type="number" min={1} value={memory} onChange={(_, v) => setMemory(Number(v))} style={{ width: 110 }} />
+                        <TextInput id="memory" type="number" min={1} value={memory} onChange={(_, v) => setMemory(v)} style={{ width: 110 }} />
                         <FormSelect aria-label="Memory unit" value={memoryUnit} onChange={(_, v) => setMemoryUnit(v as 'Gi' | 'Mi')} style={{ width: 90 }}>
                           <FormSelectOption value="Gi" label="GiB" />
                           <FormSelectOption value="Mi" label="MiB" />
@@ -274,7 +286,7 @@ export function CreateVMPage() {
                 <Flex style={{ marginTop: 16 }}>
                   <FlexItem>
                     <FormGroup label="Disk size (GiB)" fieldId="disk-size">
-                      <TextInput id="disk-size" type="number" min={1} value={diskSize} onChange={(_, v) => setDiskSize(Number(v))} style={{ width: 140 }} />
+                      <TextInput id="disk-size" type="number" min={1} value={diskSize} onChange={(_, v) => setDiskSize(v)} style={{ width: 140 }} />
                     </FormGroup>
                   </FlexItem>
                   <FlexItem>

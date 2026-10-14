@@ -1,0 +1,21 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # Deferred Close calls (SQL rows, response bodies, websockets,
+      # the store) cannot report their error anywhere useful; the reads
+      # and writes before them are checked.
+      - text: 'Error return value of `[^`]*Close` is not checked'
+        linters:
+          - errcheck
+      # SSE stream writes: a failed write only means the client went
+      # away; the handler ends on the next context check.
+      - text: 'Error return value of `fmt\.Fprint'
+        linters:
+          - errcheck
+      # Test helpers fail via t.Fatal on the operations that matter;
+      # unchecked setup/cleanup errors surface as test failures anyway.
+      - path: _test\.go$
+        linters:
+          - errcheck

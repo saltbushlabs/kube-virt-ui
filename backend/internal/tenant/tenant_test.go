@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 
@@ -62,6 +63,55 @@ func TestUserConfigReprovisions(t *testing.T) {
 	}
 	if _, err := c.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u3", metav1.GetOptions{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A ServiceAccount left behind by an Ensure that failed before creating
+// the RoleBinding must not strand the user: the token request succeeds, so
+// UserConfig has to re-run Ensure based on the role it has applied, not on
+// the ServiceAccount being missing.
+func TestUserConfigHealsMissingRoleBinding(t *testing.T) {
+	ctx := context.Background()
+	c := tenanttest.FakeClient(tenanttest.Namespace("team-a", true))
+	p := tenant.NewProvisioner(c, &rest.Config{})
+	if _, err := c.CoreV1().ServiceAccounts("team-a").Create(ctx,
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "kvui-u3", Namespace: "team-a"}},
+		metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.UserConfig(ctx, "team-a", 3, "bob", "viewer"); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := c.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u3", metav1.GetOptions{})
+	if err != nil || rb.RoleRef.Name != "kubevirt-ui-viewer" {
+		t.Fatalf("rolebinding not healed: %+v %v", rb, err)
+	}
+}
+
+// If the stored role changed but the matching Ensure failed transiently
+// (e.g. in acceptInvite), the next UserConfig for the new role must apply
+// it; conversely a RoleBinding upgraded before a failed store write (e.g.
+// in adminPutMembership) must be put back to the stored role.
+func TestUserConfigSyncsRoleDrift(t *testing.T) {
+	ctx := context.Background()
+	c := tenanttest.FakeClient(tenanttest.Namespace("team-a", true))
+	p := tenant.NewProvisioner(c, &rest.Config{})
+	if err := p.Ensure(ctx, "team-a", 3, "bob", "viewer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.UserConfig(ctx, "team-a", 3, "bob", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := c.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u3", metav1.GetOptions{})
+	if err != nil || rb.RoleRef.Name != "kubevirt-ui-owner" {
+		t.Fatalf("role not upgraded: %+v %v", rb, err)
+	}
+	if _, err := p.UserConfig(ctx, "team-a", 3, "bob", "viewer"); err != nil {
+		t.Fatal(err)
+	}
+	rb, err = c.RbacV1().RoleBindings("team-a").Get(ctx, "kvui-u3", metav1.GetOptions{})
+	if err != nil || rb.RoleRef.Name != "kubevirt-ui-viewer" {
+		t.Fatalf("role not restored: %+v %v", rb, err)
 	}
 }
 

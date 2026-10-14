@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"kvui/internal/auth"
 	"kvui/internal/store"
 	"kvui/internal/tenant"
 	"kvui/internal/vm"
@@ -44,6 +45,13 @@ type userClients struct {
 // itself on failure.
 func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients, bool) {
 	u, ns := currentUser(r), chi.URLParam(r, "ns")
+	// UserConfig may (re)provision the ServiceAccount, so the membership
+	// is read again afterwards: if it was removed in between, undo the
+	// provisioning and refuse, rather than resurrecting a ServiceAccount
+	// with no member behind it. A role changed in between is applied by
+	// going round again, so the clients returned always match a
+	// membership read taken after the last provisioning. The loop only
+	// repeats while an admin keeps changing the role mid-request.
 	m, err := s.Store.Membership(r.Context(), u.ID, ns)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusForbidden, "not a member of this namespace")
@@ -53,14 +61,36 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 		internalError(w, r, err)
 		return userClients{}, false
 	}
-	cfg, err := s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
-	if errors.Is(err, tenant.ErrNotTenant) {
-		writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
-		return userClients{}, false
-	}
-	if err != nil {
-		internalError(w, r, err)
-		return userClients{}, false
+	var cfg *rest.Config
+	for {
+		var err error
+		cfg, err = s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
+		if errors.Is(err, tenant.ErrNotTenant) {
+			writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
+			return userClients{}, false
+		}
+		if err != nil {
+			internalError(w, r, err)
+			return userClients{}, false
+		}
+		m2, err := s.Store.Membership(r.Context(), u.ID, ns)
+		if errors.Is(err, store.ErrNotFound) {
+			// Best effort, and not tied to this connection: a client that
+			// has already gone away must not cancel the cleanup.
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+			_ = s.Tenants.Remove(cleanup, ns, u.ID)
+			cancel()
+			writeError(w, http.StatusForbidden, "not a member of this namespace")
+			return userClients{}, false
+		}
+		if err != nil {
+			internalError(w, r, err)
+			return userClients{}, false
+		}
+		if m2.Role == m.Role {
+			break
+		}
+		m = m2 // apply the role just read instead of reading a third time
 	}
 	kube, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -150,12 +180,20 @@ func (s *Server) vmAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // watchVMs streams the namespace's VM list as server-sent events: the full
-// list on connect and again (debounced) after every change.
+// list on connect and again (debounced) after every change. Like consoles,
+// the stream re-validates the session and membership every consoleRecheck
+// and closes when access ends (logout, disable, membership or tenant label
+// removed) instead of serving VM data until the periodic cut: the token it
+// lists with stays valid that whole time, and the apiserver does not end
+// an already-open watch when its ServiceAccount is deleted.
 func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.clientsFor(w, r)
 	if !ok {
 		return
 	}
+	u := currentUser(r)
+	cookie, _ := r.Cookie(sessionCookie)
+	sessionHash := auth.HashToken(cookie.Value)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		internalError(w, r, errors.New("streaming unsupported"))
@@ -163,6 +201,8 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), watchMaxDuration)
 	defer cancel()
+	// End with the server's streams (shutdown) as well as with the request.
+	defer context.AfterFunc(s.streamCtx, cancel)()
 	changes, err := vm.Watch(ctx, c.dyn, c.namespace)
 	if err != nil {
 		kubeError(w, r, err)
@@ -195,6 +235,8 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 
 	heartbeat := time.NewTicker(watchHeartbeat)
 	defer heartbeat.Stop()
+	recheck := time.NewTicker(s.consoleRecheck)
+	defer recheck.Stop()
 	debounce := time.NewTimer(0)
 	<-debounce.C
 	for {
@@ -208,6 +250,10 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 			debounce.Reset(watchDebounce)
 		case <-debounce.C:
 			if !send() {
+				return
+			}
+		case <-recheck.C:
+			if s.consoleRevoked(sessionHash, u.ID, c.namespace, c.role) != "" {
 				return
 			}
 		case <-heartbeat.C:

@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -42,12 +43,20 @@ type Server struct {
 	loginLimiter  *auth.FailureLimiter
 	inviteLimiter *auth.FailureLimiter
 	now           func() time.Time
-	// consoleRecheck is how often an open console re-validates the session
-	// and membership; removing access closes consoles within this interval.
+	// consoleRecheck is how often an open console or VM watch stream
+	// re-validates the session and membership; removing access closes
+	// them within this interval.
 	consoleRecheck time.Duration
+	// streamCtx is cancelled by CloseStreams (wired to the HTTP server's
+	// RegisterOnShutdown in main) so long-lived streams end at once when
+	// shutdown begins, while ordinary requests keep their contexts and
+	// drain normally.
+	streamCtx    context.Context
+	closeStreams context.CancelFunc
 }
 
 func New(o Options) *Server {
+	streamCtx, closeStreams := context.WithCancel(context.Background())
 	return &Server{
 		Options:       o,
 		loginLimiter:  auth.NewFailureLimiter(10, 15*time.Minute),
@@ -55,8 +64,15 @@ func New(o Options) *Server {
 		now:           time.Now,
 
 		consoleRecheck: 30 * time.Second,
+		streamCtx:      streamCtx,
+		closeStreams:   closeStreams,
 	}
 }
+
+// CloseStreams ends every open console and VM watch stream. It is meant
+// for http.Server.RegisterOnShutdown: those handlers would otherwise hold
+// graceful shutdown open until its timeout.
+func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
@@ -258,9 +274,24 @@ func (s *Server) audit(r *http.Request, actor *store.User, action, namespace, ta
 
 // provision applies a membership to Kubernetes. Failures are logged rather
 // than returned where the membership is already committed: UserConfig
-// reprovisions on first use, so the user is not left stuck.
+// reprovisions on first use, so the user is not left stuck. The membership
+// is re-checked either side of Ensure so a removal racing this call (the
+// admin path removes the Kubernetes objects, deletes the row, then
+// removes again) cannot leave a ServiceAccount behind with no member.
 func (s *Server) provision(ctx context.Context, u store.User, namespace, role string) {
+	if _, err := s.Store.Membership(ctx, u.ID, namespace); errors.Is(err, store.ErrNotFound) {
+		return // removed already; nothing to apply
+	} else if err != nil {
+		slog.Error("provision: read membership", "user", u.Username, "namespace", namespace, "err", err)
+		return // UserConfig reprovisions on first use, so this is not fatal
+	}
 	if err := s.Tenants.Ensure(ctx, namespace, u.ID, u.Username, role); err != nil {
 		slog.Error("provision membership", "user", u.Username, "namespace", namespace, "err", err)
+		return
+	}
+	if _, err := s.Store.Membership(ctx, u.ID, namespace); errors.Is(err, store.ErrNotFound) {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = s.Tenants.Remove(cleanup, namespace, u.ID)
 	}
 }

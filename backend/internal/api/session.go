@@ -69,6 +69,25 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u store.Us
 	return nil
 }
 
+// hashWait reports whether a password-hash error ends the request (the
+// response, if any, has been written). An over-long password is not an
+// error here: it simply cannot match, and the request continues as an
+// ordinary failed attempt so the response stays indistinguishable.
+func (s *Server) hashWait(w http.ResponseWriter, r *http.Request, err error) bool {
+	switch {
+	case err == nil, errors.Is(err, auth.ErrPasswordTooLong):
+		return false
+	case errors.Is(err, auth.ErrHashBusy):
+		writeError(w, http.StatusServiceUnavailable, "server busy, try again shortly")
+		return true
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return true // the client has gone away; nothing useful left to send
+	default:
+		internalError(w, r, err)
+		return true
+	}
+}
+
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Username, Password, Code string }
 	if !decode(w, r, &req) {
@@ -81,23 +100,41 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	// plus a required second factor.
 	ipKey := s.rateKey(r)
 	userKey := "user:" + strings.ToLower(req.Username) + "|" + ipKey
-	if !s.loginLimiter.Allowed(userKey) || !s.loginLimiter.Allowed(ipKey) {
+	// Acquire reserves the attempt before the (slow) password check, so a
+	// burst of concurrent attempts cannot all pass while none has failed
+	// yet; the deferred Release records the outcome.
+	acquired := false
+	failed := false
+	defer func() {
+		if acquired {
+			s.loginLimiter.Release(userKey, failed)
+			s.loginLimiter.Release(ipKey, failed)
+		}
+	}()
+	if !s.loginLimiter.Acquire(userKey) {
 		writeError(w, http.StatusTooManyRequests, "too many failed attempts, try again later")
 		return
 	}
+	if !s.loginLimiter.Acquire(ipKey) {
+		s.loginLimiter.Release(userKey, false)
+		writeError(w, http.StatusTooManyRequests, "too many failed attempts, try again later")
+		return
+	}
+	acquired = true
 
 	u, err := s.Store.UserByUsername(r.Context(), req.Username)
 	ok := false
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		auth.BurnPasswordCheck(req.Password)
+		if s.hashWait(w, r, auth.BurnPasswordCheck(r.Context(), req.Password)) {
+			return
+		}
 	case err != nil:
 		internalError(w, r, err)
 		return
 	default:
-		ok, err = auth.VerifyPassword(u.PasswordHash, req.Password)
-		if err != nil {
-			internalError(w, r, err)
+		ok, err = auth.VerifyPassword(r.Context(), u.PasswordHash, req.Password)
+		if s.hashWait(w, r, err) {
 			return
 		}
 		ok = ok && !u.Disabled
@@ -109,8 +146,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ok {
-		s.loginLimiter.Fail(userKey)
-		s.loginLimiter.Fail(ipKey)
+		failed = true
 		s.audit(r, nil, "login.failed", "", req.Username)
 		writeError(w, http.StatusUnauthorized, "invalid username, password or code")
 		return

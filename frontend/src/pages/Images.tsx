@@ -58,6 +58,11 @@ function UploadModal({ ns, onClose }: { ns: string; onClose: () => void }) {
   const [meta, setMeta] = useState<UploadMeta>({ name: '', type: 'iso', size: '' })
   const [stage, setStage] = useState<UploadStage | null>(null)
   const [error, setError] = useState('')
+  // Name of the image a previous attempt in this modal actually created
+  // (recorded only once creation has succeeded), so a retry resumes it
+  // instead of failing with "already exists" — while a name that was
+  // already taken before this modal opened keeps erroring.
+  const [attempted, setAttempted] = useState('')
   const busy = stage !== null
 
   // Leaving the page aborts the upload, so ask first.
@@ -72,8 +77,15 @@ function UploadModal({ ns, onClose }: { ns: string; onClose: () => void }) {
     e.preventDefault()
     if (!file) return
     setError('')
+    const resume = attempted === meta.name
+    // 'waiting' is only reached after the create call succeeded (or was
+    // resumed), so only then is the name ours to resume on a retry.
+    const onStage = (s: UploadStage) => {
+      if (s.stage === 'waiting') setAttempted(meta.name)
+      setStage(s)
+    }
     try {
-      await uploadImage(ns, file, { ...meta, storageClass: meta.storageClass || undefined }, setStage)
+      await uploadImage(ns, file, { ...meta, storageClass: meta.storageClass || undefined }, onStage, resume)
       onClose()
     } catch (err) {
       setError((err as Error).message)
@@ -196,7 +208,19 @@ export function ImagesPage() {
       </PageSection>
       <PageSection>
         {(error || images.error) && (
-          <Alert variant="danger" isInline title={error || images.error} actionClose={<AlertActionCloseButton onClose={() => setError('')} />} />
+          <Alert
+            variant="danger"
+            isInline
+            title={error || images.error}
+            actionClose={
+              <AlertActionCloseButton
+                onClose={() => {
+                  setError('')
+                  images.clearError()
+                }}
+              />
+            }
+          />
         )}
         {images.data?.length === 0 ? (
           <EmptyState titleText="No images" headingLevel="h2">

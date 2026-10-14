@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 
@@ -133,6 +133,11 @@ func (r *CreateRequest) Validate() error {
 	if r.DiskSource == SourceContainerDisk {
 		r.DiskSize, r.StorageClass = "", ""
 	} else {
+		// Build names the root DataVolume "<name>-root", which must stay
+		// within the 63-character DNS label limit.
+		if len(r.Name) > 58 {
+			return invalid("name must be at most 58 characters so its disk name fits within 63")
+		}
 		size, err := resource.ParseQuantity(r.DiskSize)
 		if err != nil || size.Cmp(minDisk) < 0 {
 			return invalid("disk size must be at least 1Gi, e.g. 20Gi")
@@ -182,21 +187,90 @@ func checkImportURL(raw string) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return invalid("enter an http:// or https:// URL to a disk image")
 	}
-	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || strings.HasSuffix(host, ".svc") || strings.HasSuffix(host, ".local") ||
-		strings.Contains(host, ".svc.") || !strings.Contains(host, ".") && net.ParseIP(host) == nil {
+	// URL hosts may carry a zone ("%zone" for IPv6 literals); it only makes
+	// sense for local addresses, so refuse it rather than parse around it.
+	if strings.Contains(u.Host, "%") {
 		return invalid("image URLs must point at a public host")
 	}
-	if ip := net.ParseIP(host); ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || isCGNAT(ip)) {
+	// A trailing dot makes "localhost." a different string but the same
+	// host; strip it before comparing.
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !isPublicIP(ip) {
+			return invalid("image URLs must point at a public host")
+		}
+		// Transition mechanisms embed an IPv4 address that is what will
+		// actually be reached (IPv4-mapped, NAT64, 6to4); it must pass
+		// the same test, since the outer address looks globally routable.
+		if v4, ok := embeddedIPv4(ip); ok && !isPublicIP(v4) {
+			return invalid("image URLs must point at a public host")
+		}
+		return nil
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".svc") || strings.HasSuffix(host, ".local") ||
+		strings.Contains(host, ".svc.") || !strings.Contains(host, ".") {
+		return invalid("image URLs must point at a public host")
+	}
+	// Shorthand and non-decimal IPv4 forms (127.1, 0177.0.0.1, 0x7f.1) do
+	// not parse as addresses above, but other resolvers in the importer
+	// may still read them as IPs. A final all-numeric (or 0x…) label is
+	// the giveaway (RFC 3696 §2); no public host looks like that.
+	if last := host[strings.LastIndex(host, ".")+1:]; isNumericLabel(last) {
 		return invalid("image URLs must point at a public host")
 	}
 	return nil
 }
 
-func isCGNAT(ip net.IP) bool {
-	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-	return cgnat.Contains(ip)
+var (
+	cgnat      = netip.MustParsePrefix("100.64.0.0/10")
+	zeroNet    = netip.MustParsePrefix("0.0.0.0/8") // "this host" range; Linux routes it to loopback
+	nat64WK    = netip.MustParsePrefix("64:ff9b::/96")
+	nat64Local = netip.MustParsePrefix("64:ff9b:1::/48")
+	sixToFour  = netip.MustParsePrefix("2002::/16")
+)
+
+func isPublicIP(ip netip.Addr) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !cgnat.Contains(ip.Unmap()) && !zeroNet.Contains(ip.Unmap())
+}
+
+// embeddedIPv4 extracts the IPv4 address carried by an IPv4-mapped, NAT64
+// (well-known or local-use prefix) or 6to4 address. The NAT64 extraction
+// reads the last 32 bits, which is where a /96 prefix puts the address;
+// the well-known prefix is always /96, and the local-use prefix is most
+// commonly deployed that way too, but RFC 6052 allows other prefix
+// lengths that place the address elsewhere. Those are not decoded — this
+// check is defence in depth behind the importer NetworkPolicy, not the
+// boundary itself.
+func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
+	if ip.Is4() {
+		return netip.Addr{}, false
+	}
+	if ip.Is4In6() {
+		return ip.Unmap(), true
+	}
+	b := ip.As16()
+	switch {
+	case nat64WK.Contains(ip), nat64Local.Contains(ip):
+		return netip.AddrFrom4([4]byte(b[12:])), true
+	case sixToFour.Contains(ip):
+		return netip.AddrFrom4([4]byte(b[2:6])), true
+	}
+	return netip.Addr{}, false
+}
+
+func isNumericLabel(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "0x") {
+		return true
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CloudConfig returns the cloud-init user data for r: the user's own, or a

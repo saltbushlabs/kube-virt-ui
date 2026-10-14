@@ -59,8 +59,9 @@ type Provisioner struct {
 	client kubernetes.Interface
 	base   *rest.Config
 
-	mu     sync.Mutex
-	tokens map[string]cachedToken // key: namespace/account
+	mu      sync.Mutex
+	tokens  map[string]cachedToken // key: namespace/account
+	ensured map[string]string      // key: namespace/account; role last fully applied by Ensure
 }
 
 type cachedToken struct {
@@ -69,7 +70,19 @@ type cachedToken struct {
 }
 
 func NewProvisioner(client kubernetes.Interface, base *rest.Config) *Provisioner {
-	return &Provisioner{client: client, base: base, tokens: map[string]cachedToken{}}
+	return &Provisioner{client: client, base: base, tokens: map[string]cachedToken{}, ensured: map[string]string{}}
+}
+
+func (p *Provisioner) markEnsured(namespace string, userID int64, role string) {
+	p.mu.Lock()
+	p.ensured[namespace+"/"+accountName(userID)] = role
+	p.mu.Unlock()
+}
+
+func (p *Provisioner) ensuredRole(namespace string, userID int64) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ensured[namespace+"/"+accountName(userID)]
 }
 
 // Namespaces lists tenant namespaces.
@@ -133,7 +146,8 @@ func (p *Provisioner) Ensure(ctx context.Context, namespace string, userID int64
 	case apierrors.IsNotFound(err):
 	case err != nil:
 		return err
-	case existing.RoleRef == want.RoleRef:
+	case existing.RoleRef == want.RoleRef && len(existing.Subjects) == 1 && existing.Subjects[0] == want.Subjects[0]:
+		p.markEnsured(namespace, userID, role)
 		return nil
 	default:
 		// roleRef is immutable, so a role change is delete and recreate.
@@ -144,6 +158,7 @@ func (p *Provisioner) Ensure(ctx context.Context, namespace string, userID int64
 	if _, err := rbs.Create(ctx, want, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create rolebinding: %w", err)
 	}
+	p.markEnsured(namespace, userID, role)
 	return nil
 }
 
@@ -153,6 +168,7 @@ func (p *Provisioner) Remove(ctx context.Context, namespace string, userID int64
 	name := accountName(userID)
 	p.mu.Lock()
 	delete(p.tokens, namespace+"/"+name)
+	delete(p.ensured, namespace+"/"+name)
 	p.mu.Unlock()
 	if err := p.client.RbacV1().RoleBindings(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return err
@@ -164,9 +180,11 @@ func (p *Provisioner) Remove(ctx context.Context, namespace string, userID int64
 }
 
 // UserConfig returns a rest.Config that authenticates as the membership's
-// ServiceAccount. Callers must have checked the membership exists. If the
-// ServiceAccount is missing (provisioning failed earlier, or was deleted out
-// of band) it is recreated first.
+// ServiceAccount. Callers must have checked the membership exists. Unless
+// this process has already applied role in full, Ensure runs first, so a
+// partially provisioned membership (ServiceAccount without its RoleBinding,
+// or a RoleBinding left at a previous role by a transient failure) heals on
+// first use instead of only when the ServiceAccount itself is missing.
 //
 // The namespace must still be a tenant. Once an admin removes the tenant
 // label, UserConfig returns ErrNotTenant and, best effort, removes the
@@ -184,8 +202,17 @@ func (p *Provisioner) UserConfig(ctx context.Context, namespace string, userID i
 		}
 		return nil, err
 	}
+	if p.ensuredRole(namespace, userID) != role {
+		if err := p.Ensure(ctx, namespace, userID, username, role); err != nil {
+			return nil, err
+		}
+	}
 	token, err := p.token(ctx, namespace, userID)
 	if apierrors.IsNotFound(err) {
+		// Deleted out of band after Ensure ran; recreate and retry once.
+		p.mu.Lock()
+		delete(p.ensured, namespace+"/"+accountName(userID))
+		p.mu.Unlock()
 		if err := p.Ensure(ctx, namespace, userID, username, role); err != nil {
 			return nil, err
 		}

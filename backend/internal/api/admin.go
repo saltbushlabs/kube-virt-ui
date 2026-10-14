@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -227,6 +229,18 @@ func (s *Server) adminDeleteMembership(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.DeleteMembership(r.Context(), target.ID, ns); err != nil && !errors.Is(err, store.ErrNotFound) {
 		internalError(w, r, err)
 		return
+	}
+	// Remove again, best effort: a request from the removed user that
+	// passed its membership check before the row was deleted re-creates
+	// the ServiceAccount and RoleBinding in UserConfig. With the row now
+	// gone, that request's own re-check refuses it, and this second
+	// Remove deletes anything it recreated in the window, so no orphan
+	// is left whichever way the timing falls. WithoutCancel because the
+	// cleanup must not die with the admin's connection.
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+	if err := s.Tenants.Remove(cleanup, ns, target.ID); err != nil {
+		slog.Error("cleanup after membership removal", "namespace", ns, "user", target.Username, "err", err)
 	}
 	s.audit(r, currentUser(r), "membership.remove", ns, target.Username)
 	w.WriteHeader(http.StatusNoContent)

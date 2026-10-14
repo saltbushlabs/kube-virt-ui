@@ -25,7 +25,7 @@ function RequireUser({ admin, children }: { admin?: boolean; children: React.Rea
         <Spinner />
       </Bullseye>
     )
-  if (!me) return <Navigate to={`/login?next=${encodeURIComponent(location.pathname)}`} replace />
+  if (!me) return <Navigate to={`/login?next=${encodeURIComponent(location.pathname + location.search + location.hash)}`} replace />
   if (admin && !me.user.isAdmin) return <Navigate to="/" replace />
   return <Layout>{children}</Layout>
 }

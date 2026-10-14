@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -183,19 +184,48 @@ func run() error {
 	go purgeSessions(ctx, st)
 
 	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	// When shutdown starts, end the long-lived streams at once so they do
+	// not hold it open; ordinary in-flight requests are left to finish.
+	httpSrv.RegisterOnShutdown(srv.CloseStreams)
+	ln, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		return err
+	}
+	slog.Info("listening", "addr", cfg.listen)
+	return serveHTTP(ctx, ln, httpSrv)
+}
+
+var shutdownTimeout = 10 * time.Second
+
+// serveHTTP serves on ln until ctx ends, then shuts down gracefully and
+// waits for that to finish. Request contexts are deliberately not tied to
+// ctx: ordinary in-flight requests (creates, uploads, redeems) must be
+// allowed to finish their writes during the drain. Only the long-lived
+// streams are cut at shutdown, via the RegisterOnShutdown hook; without
+// waiting for Shutdown here the process would exit mid-request as soon as
+// the listener closed.
+func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// WithoutCancel: the shutdown deadline runs from now, after ctx has
+		// already ended, so it cannot be derived from ctx itself.
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 		defer cancel()
-		if err := httpSrv.Shutdown(shutdown); err != nil {
+		if err := srv.Shutdown(shutdown); err != nil {
 			slog.Error("shutdown", "err", err)
 		}
 	}()
-	slog.Info("listening", "addr", cfg.listen)
-	if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		return err
+	err := srv.Serve(ln)
+	cancel() // if Serve failed on its own, release the shutdown goroutine
+	<-done
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 func purgeSessions(ctx context.Context, st *store.Store) {

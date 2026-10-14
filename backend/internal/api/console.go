@@ -77,6 +77,8 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-s.streamCtx.Done():
+			return // server shutting down; the deferred closes end both sides
 		case <-errc:
 			msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "console closed")
 			_ = client.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second)) // best effort; closing anyway
@@ -95,12 +97,12 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// consoleRevoked returns why an open console must close, or "" if the
-// session is still valid, the user still holds the role they opened the
-// console with, and the namespace is still a tenant. Any role change closes
-// the console, even operator <-> owner which both allow consoles: it is
-// simpler than mirroring the ClusterRoles' console rules here, and the
-// browser can reopen the console under the new role.
+// consoleRevoked returns why an open console or VM watch stream must
+// close, or "" if the session is still valid, the user still holds the
+// role they opened it with, and the namespace is still a tenant. Any role
+// change closes it, even operator <-> owner which both allow consoles: it
+// is simpler than mirroring the ClusterRoles' console rules here, and the
+// browser can reopen it under the new role.
 func (s *Server) consoleRevoked(sessionHash string, userID int64, namespace, role string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

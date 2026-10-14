@@ -192,6 +192,50 @@ func TestInviteToNamespaceFlow(t *testing.T) {
 	}
 }
 
+// The TOTP step validates the username before any QR code is shown, and
+// re-entering the step returns the same secret instead of rotating it.
+func TestInviteTOTPValidatesAndReuses(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, adminLink, err := CreateInvite(ctx, e.store, "https://ui.test",
+		store.Invite{MakeAdmin: true, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.redeem(e.client(), adminLink, "root")
+
+	_, link, err := CreateInvite(ctx, e.store, "https://ui.test",
+		store.Invite{Namespace: "team-a", Role: "viewer", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := link[strings.LastIndex(link, "/")+1:]
+	c := e.client()
+	totp := func(username string) (int, string) {
+		var res struct{ Secret string }
+		st := e.do(c, "POST", "/api/invites/"+token+"/totp", map[string]string{"username": username}, &res)
+		return st, res.Secret
+	}
+	if st, _ := totp("NO WAY"); st != 400 {
+		t.Fatalf("invalid username: %d", st)
+	}
+	if st, _ := totp("root"); st != 409 {
+		t.Fatalf("taken username: %d", st)
+	}
+	st, first := totp("alice")
+	if st != 200 || first == "" {
+		t.Fatalf("totp: %d", st)
+	}
+	if st, again := totp("alice"); st != 200 || again != first {
+		t.Fatalf("secret rotated on re-entry: %d", st)
+	}
+	// Without a usable invite there is no username-availability answer.
+	var res struct{ Secret string }
+	if st := e.do(c, "POST", "/api/invites/not-a-real-token/totp", map[string]string{"username": "root"}, &res); st != 404 {
+		t.Fatalf("enumeration without invite: %d", st)
+	}
+}
+
 func TestCSRFHeaderRequired(t *testing.T) {
 	e := newEnv(t)
 	resp, err := http.Post(e.srv.URL+"/api/login", "application/json", strings.NewReader(`{}`))

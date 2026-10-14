@@ -162,7 +162,11 @@ func summarize(vm, vmi *unstructured.Unstructured, dvs map[string]*unstructured.
 
 	volumes, _, _ := unstructured.NestedSlice(obj, "spec", "template", "spec", "volumes")
 	for _, v := range volumes {
-		name, _, _ := unstructured.NestedString(v.(map[string]any), "dataVolume", "name")
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue // malformed volume entry; not a reason to fail the whole list
+		}
+		name, _, _ := unstructured.NestedString(m, "dataVolume", "name")
 		if dv := dvs[name]; dv != nil {
 			s.Disks = append(s.Disks, diskStatus(dv))
 		}

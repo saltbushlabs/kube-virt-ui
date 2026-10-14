@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"kvui/internal/auth"
 	"kvui/internal/store"
 	"kvui/internal/tenant"
 	"kvui/internal/vm"
@@ -150,12 +151,20 @@ func (s *Server) vmAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // watchVMs streams the namespace's VM list as server-sent events: the full
-// list on connect and again (debounced) after every change.
+// list on connect and again (debounced) after every change. Like consoles,
+// the stream re-validates the session and membership every consoleRecheck
+// and closes when access ends (logout, disable, membership or tenant label
+// removed) instead of serving VM data until the periodic cut: the token it
+// lists with stays valid that whole time, and the apiserver does not end
+// an already-open watch when its ServiceAccount is deleted.
 func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.clientsFor(w, r)
 	if !ok {
 		return
 	}
+	u := currentUser(r)
+	cookie, _ := r.Cookie(sessionCookie)
+	sessionHash := auth.HashToken(cookie.Value)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		internalError(w, r, errors.New("streaming unsupported"))
@@ -195,6 +204,8 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 
 	heartbeat := time.NewTicker(watchHeartbeat)
 	defer heartbeat.Stop()
+	recheck := time.NewTicker(s.consoleRecheck)
+	defer recheck.Stop()
 	debounce := time.NewTimer(0)
 	<-debounce.C
 	for {
@@ -208,6 +219,10 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 			debounce.Reset(watchDebounce)
 		case <-debounce.C:
 			if !send() {
+				return
+			}
+		case <-recheck.C:
+			if s.consoleRevoked(sessionHash, u.ID, c.namespace, c.role) != "" {
 				return
 			}
 		case <-heartbeat.C:

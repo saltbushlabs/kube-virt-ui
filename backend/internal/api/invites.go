@@ -74,29 +74,58 @@ func (s *Server) getInvite(w http.ResponseWriter, r *http.Request) {
 }
 
 // inviteTOTP generates the TOTP secret the new user enrols in their
-// authenticator. Calling it again replaces the secret.
+// authenticator. Calling it again returns the same secret, so going back
+// a step in the signup form does not invalidate the entry the user just
+// scanned. The username is validated here, before the QR code is shown,
+// rather than only at redeem time when changing it would restart the
+// enrolment.
 func (s *Server) inviteTOTP(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Username string }
 	if !decode(w, r, &req) {
 		return
 	}
+	// The invite is loaded first: the username-availability answer below
+	// must only be given to whoever holds a usable invite link.
 	inv, ok := s.usableInvite(w, r)
 	if !ok {
 		return
 	}
-	secret, err := auth.NewTOTPSecret()
-	if err != nil {
-		internalError(w, r, err)
-		return
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	if req.Username != "" {
+		if !usernameRE.MatchString(req.Username) {
+			writeError(w, http.StatusBadRequest, "username must be 3-32 characters: a-z, 0-9, '.', '_' or '-'")
+			return
+		}
+		if _, err := s.Store.UserByUsername(r.Context(), req.Username); err == nil {
+			writeError(w, http.StatusConflict, "username is already taken")
+			return
+		} else if !errors.Is(err, store.ErrNotFound) {
+			internalError(w, r, err)
+			return
+		}
 	}
-	sealed, err := s.Sealer.Seal(secret)
-	if err != nil {
-		internalError(w, r, err)
-		return
-	}
-	if err := s.Store.SetInvitePendingTOTP(r.Context(), inv.ID, sealed); err != nil {
-		internalError(w, r, err)
-		return
+	var secret string
+	if inv.PendingTOTP != nil {
+		var err error
+		if secret, err = s.Sealer.Open(inv.PendingTOTP); err != nil {
+			internalError(w, r, err)
+			return
+		}
+	} else {
+		var err error
+		if secret, err = auth.NewTOTPSecret(); err != nil {
+			internalError(w, r, err)
+			return
+		}
+		sealed, err := s.Sealer.Seal(secret)
+		if err != nil {
+			internalError(w, r, err)
+			return
+		}
+		if err := s.Store.SetInvitePendingTOTP(r.Context(), inv.ID, sealed); err != nil {
+			internalError(w, r, err)
+			return
+		}
 	}
 	account := req.Username
 	if account == "" {
@@ -134,13 +163,12 @@ func (s *Server) redeemInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "authenticator code is incorrect")
 		return
 	}
-	pwHash, err := auth.HashPassword(req.Password)
-	if errors.Is(err, auth.ErrWeakPassword) {
+	pwHash, err := auth.HashPassword(r.Context(), req.Password)
+	if errors.Is(err, auth.ErrWeakPassword) || errors.Is(err, auth.ErrPasswordTooLong) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err != nil {
-		internalError(w, r, err)
+	if s.hashWait(w, r, err) {
 		return
 	}
 	codes, err := auth.NewRecoveryCodes(recoveryCodeCount)

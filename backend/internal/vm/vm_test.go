@@ -51,6 +51,20 @@ func TestSummarizeIgnoresLingeringInstanceWhenStopped(t *testing.T) {
 	}
 }
 
+// A non-object entry in the volumes list must be skipped, not panic the
+// whole VM list.
+func TestSummarizeMalformedVolume(t *testing.T) {
+	vm := obj(t, `{"metadata":{"name":"web"},"status":{"printableStatus":"Running"},
+		"spec":{"template":{"spec":{"volumes":[null,"junk",{"name":"root","dataVolume":{"name":"web-root"}}]}}}}`)
+	dvs := map[string]*unstructured.Unstructured{
+		"web-root": obj(t, `{"metadata":{"name":"web-root"},"status":{"phase":"Succeeded"}}`),
+	}
+	s := summarize(vm, nil, dvs)
+	if len(s.Disks) != 1 || s.Disks[0].Name != "web-root" {
+		t.Fatalf("%+v", s.Disks)
+	}
+}
+
 func TestSummarizeDisks(t *testing.T) {
 	vm := obj(t, `{"metadata":{"name":"web"},"status":{"printableStatus":"Provisioning"},
 		"spec":{"template":{"spec":{"volumes":[{"name":"root","dataVolume":{"name":"web-root"}},{"name":"ci","cloudInitNoCloud":{}}]}}}}`)

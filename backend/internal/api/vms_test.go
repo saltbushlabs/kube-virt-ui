@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
@@ -16,6 +17,15 @@ import (
 // records "METHOD path token" for each request.
 func (e *env) fakeKubeVirt(w http.ResponseWriter, r *http.Request) {
 	e.requests = append(e.requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+	if r.URL.Query().Get("watch") == "true" {
+		// Hold the watch open without sending events until the client goes away.
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/apis/subresources.kubevirt.io/v1/namespaces/team-a/virtualmachineinstances/web/") {
 		fakeConsole(w, r)
 		return
@@ -125,6 +135,70 @@ func TestDelabelledNamespaceRefused(t *testing.T) {
 	}
 	if len(e.requests) != before {
 		t.Fatalf("apiserver called for de-labelled namespace: %v", e.requests[before:])
+	}
+}
+
+// An open watch stream must end promptly when access is revoked, not
+// serve VM data until the five-minute cut: the ServiceAccount token it
+// lists with is unaffected by logout, disable or membership removal.
+func TestWatchVMsEndsOnRevocation(t *testing.T) {
+	e := newEnv(t)
+	e.api.consoleRecheck = 50 * time.Millisecond
+	ctx := context.Background()
+	_, link, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	alice := e.client()
+	e.redeem(alice, link, "alice")
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/namespaces/team-a/watch/vms", nil)
+	req.Header.Set("X-Requested-With", "kvui")
+	resp, err := alice.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("watch: %d", resp.StatusCode)
+	}
+	lines := make(chan string, 16)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	// The initial list arrives.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatal("stream ended before the initial list")
+			}
+			if strings.Contains(line, `"web"`) {
+				goto listed
+			}
+		case <-deadline:
+			t.Fatal("no initial VM list on the stream")
+		}
+	}
+listed:
+
+	// Logging out ends the stream even though no VM changes arrive.
+	if st := e.do(alice, "POST", "/api/logout", nil, nil); st != 204 {
+		t.Fatalf("logout: %d", st)
+	}
+	deadline = time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-lines:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("watch stream stayed open after logout")
+		}
 	}
 }
 

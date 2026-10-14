@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 
@@ -133,6 +133,11 @@ func (r *CreateRequest) Validate() error {
 	if r.DiskSource == SourceContainerDisk {
 		r.DiskSize, r.StorageClass = "", ""
 	} else {
+		// Build names the root DataVolume "<name>-root", which must stay
+		// within the 63-character DNS label limit.
+		if len(r.Name) > 58 {
+			return invalid("name must be at most 58 characters so its disk name fits within 63")
+		}
 		size, err := resource.ParseQuantity(r.DiskSize)
 		if err != nil || size.Cmp(minDisk) < 0 {
 			return invalid("disk size must be at least 1Gi, e.g. 20Gi")
@@ -182,21 +187,52 @@ func checkImportURL(raw string) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return invalid("enter an http:// or https:// URL to a disk image")
 	}
-	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || strings.HasSuffix(host, ".svc") || strings.HasSuffix(host, ".local") ||
-		strings.Contains(host, ".svc.") || !strings.Contains(host, ".") && net.ParseIP(host) == nil {
+	// URL hosts may carry a zone ("%zone" for IPv6 literals); it only makes
+	// sense for local addresses, so refuse it rather than parse around it.
+	if strings.Contains(u.Host, "%") {
 		return invalid("image URLs must point at a public host")
 	}
-	if ip := net.ParseIP(host); ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || isCGNAT(ip)) {
+	// A trailing dot makes "localhost." a different string but the same
+	// host; strip it before comparing.
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || cgnat.Contains(ip.Unmap()) || zeroNet.Contains(ip.Unmap()) {
+			return invalid("image URLs must point at a public host")
+		}
+		return nil
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".svc") || strings.HasSuffix(host, ".local") ||
+		strings.Contains(host, ".svc.") || !strings.Contains(host, ".") {
+		return invalid("image URLs must point at a public host")
+	}
+	// Shorthand and non-decimal IPv4 forms (127.1, 0177.0.0.1, 0x7f.1) do
+	// not parse as addresses above, but other resolvers in the importer
+	// may still read them as IPs. A final all-numeric (or 0x…) label is
+	// the giveaway (RFC 3696 §2); no public host looks like that.
+	if last := host[strings.LastIndex(host, ".")+1:]; isNumericLabel(last) {
 		return invalid("image URLs must point at a public host")
 	}
 	return nil
 }
 
-func isCGNAT(ip net.IP) bool {
-	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-	return cgnat.Contains(ip)
+var (
+	cgnat   = netip.MustParsePrefix("100.64.0.0/10")
+	zeroNet = netip.MustParsePrefix("0.0.0.0/8") // "this host" range; Linux routes it to loopback
+)
+
+func isNumericLabel(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "0x") {
+		return true
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CloudConfig returns the cloud-init user data for r: the user's own, or a

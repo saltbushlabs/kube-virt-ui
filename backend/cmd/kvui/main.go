@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -183,19 +184,43 @@ func run() error {
 	go purgeSessions(ctx, st)
 
 	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		return err
+	}
+	slog.Info("listening", "addr", cfg.listen)
+	return serveHTTP(ctx, ln, httpSrv)
+}
+
+var shutdownTimeout = 10 * time.Second
+
+// serveHTTP serves on ln until ctx ends, then shuts down gracefully and
+// waits for that to finish. Request contexts derive from ctx (BaseContext),
+// so cancellation ends long-lived handlers such as the VM watch streams at
+// once: without it Shutdown would wait on them until the timeout, and
+// without waiting for Shutdown here the process would exit mid-request as
+// soon as the listener closed.
+func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	srv.BaseContext = func(net.Listener) context.Context { return ctx }
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := httpSrv.Shutdown(shutdown); err != nil {
+		if err := srv.Shutdown(shutdown); err != nil {
 			slog.Error("shutdown", "err", err)
 		}
 	}()
-	slog.Info("listening", "addr", cfg.listen)
-	if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		return err
+	err := srv.Serve(ln)
+	cancel() // if Serve failed on its own, release the shutdown goroutine
+	<-done
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 func purgeSessions(ctx context.Context, st *store.Store) {

@@ -42,8 +42,9 @@ type Server struct {
 	loginLimiter  *auth.FailureLimiter
 	inviteLimiter *auth.FailureLimiter
 	now           func() time.Time
-	// consoleRecheck is how often an open console re-validates the session
-	// and membership; removing access closes consoles within this interval.
+	// consoleRecheck is how often an open console or VM watch stream
+	// re-validates the session and membership; removing access closes
+	// them within this interval.
 	consoleRecheck time.Duration
 }
 

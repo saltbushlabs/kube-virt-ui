@@ -108,6 +108,10 @@ export function InvitePage() {
   if (step === 'account') {
     const submit = (e: FormEvent) => {
       e.preventDefault()
+      if (password.length < 12) {
+        setError('Password must be at least 12 characters')
+        return
+      }
       if (password !== confirm) {
         setError('Passwords do not match')
         return

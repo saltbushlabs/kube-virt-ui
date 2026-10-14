@@ -26,7 +26,7 @@ export function Layout({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
 
   const item = (to: string, label: string, prefix = false) => (
-    <NavItem key={to} isActive={prefix ? location.pathname.startsWith(to) : location.pathname === to}>
+    <NavItem key={to} isActive={prefix ? location.pathname === to || location.pathname.startsWith(to + '/') : location.pathname === to}>
       <NavLink to={to}>{label}</NavLink>
     </NavItem>
   )

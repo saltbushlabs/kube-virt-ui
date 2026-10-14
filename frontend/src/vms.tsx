@@ -23,6 +23,16 @@ export function useVMWatch(ns: string) {
   const [vms, setVms] = useState<VM[] | null>(null)
   const [error, setError] = useState('')
 
+  // Clear the previous namespace's list during render when ns changes, so
+  // it is not shown (or acted on) under the new namespace's title while
+  // its stream connects.
+  const [prevNs, setPrevNs] = useState(ns)
+  if (prevNs !== ns) {
+    setPrevNs(ns)
+    setVms(null)
+    setError('')
+  }
+
   useEffect(() => {
     const es = new EventSource('/api' + vmPath(ns) + '/watch/vms')
     es.onmessage = (e) => {

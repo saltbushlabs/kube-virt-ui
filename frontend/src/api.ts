@@ -57,9 +57,10 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T = void>(method: string, path: string, body?: unknown): Promise<T> {
+export async function api<T = void>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch('/api' + path, {
     method,
+    signal,
     credentials: 'same-origin',
     headers: {
       // Required by the backend's CSRF check on state-changing requests.

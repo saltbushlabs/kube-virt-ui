@@ -22,12 +22,17 @@ export function suggestImage(file: File): UploadMeta {
   return { name, type, size: `${type === 'disk' ? Math.max(10, gib) : gib}Gi` }
 }
 
-async function waitUntilReady(ns: string, name: string) {
+// waitUntilReady reports whether the image is ready to receive data. It
+// returns false when a previous attempt already uploaded it, so a retry
+// after a *successful* send the browser misreported finishes instead of
+// trying to upload into a completed image.
+async function waitUntilReady(ns: string, name: string): Promise<boolean> {
   const deadline = Date.now() + 5 * 60_000
   for (;;) {
     const img = (await api<Image[]>('GET', vmPath(ns) + '/images')).find((i) => i.name === name)
     if (img?.problem) throw new Error(img.problem)
-    if (img?.phase === 'UploadReady') return
+    if (img?.phase === 'UploadReady') return true
+    if (img?.phase === 'Succeeded') return false
     if (Date.now() > deadline)
       throw new Error(`Timed out waiting for the image to be ready for upload (stuck in ${img?.phase || 'Pending'}). Delete it and try again.`)
     await new Promise((r) => setTimeout(r, 2000))
@@ -59,11 +64,19 @@ function send(ns: string, name: string, file: File, onProgress: (percent: number
 
 // uploadImage creates the image, waits for CDI's upload server and streams
 // the file. CDI then converts the data; the image list shows that phase.
-export async function uploadImage(ns: string, file: File, meta: UploadMeta, onStage: (s: UploadStage) => void) {
+// Retrying after a failure (resume, set by the caller for a name it
+// already attempted in this session) reuses the image the first attempt
+// created — the create then conflicts — rather than failing on the
+// conflict itself. Without resume a conflict is a real name clash.
+export async function uploadImage(ns: string, file: File, meta: UploadMeta, onStage: (s: UploadStage) => void, resume = false) {
   onStage({ stage: 'creating' })
-  await api('POST', vmPath(ns) + '/images', meta)
+  try {
+    await api('POST', vmPath(ns) + '/images', meta)
+  } catch (e) {
+    if (!resume || !(e instanceof ApiError) || e.status !== 409) throw e
+  }
   onStage({ stage: 'waiting' })
-  await waitUntilReady(ns, meta.name)
+  if (!(await waitUntilReady(ns, meta.name))) return
   onStage({ stage: 'uploading', percent: 0 })
   await send(ns, meta.name, file, (percent) => onStage({ stage: 'uploading', percent }))
 }

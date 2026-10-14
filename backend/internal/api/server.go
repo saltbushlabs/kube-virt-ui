@@ -46,9 +46,16 @@ type Server struct {
 	// re-validates the session and membership; removing access closes
 	// them within this interval.
 	consoleRecheck time.Duration
+	// streamCtx is cancelled by CloseStreams (wired to the HTTP server's
+	// RegisterOnShutdown in main) so long-lived streams end at once when
+	// shutdown begins, while ordinary requests keep their contexts and
+	// drain normally.
+	streamCtx    context.Context
+	closeStreams context.CancelFunc
 }
 
 func New(o Options) *Server {
+	streamCtx, closeStreams := context.WithCancel(context.Background())
 	return &Server{
 		Options:       o,
 		loginLimiter:  auth.NewFailureLimiter(10, 15*time.Minute),
@@ -56,8 +63,15 @@ func New(o Options) *Server {
 		now:           time.Now,
 
 		consoleRecheck: 30 * time.Second,
+		streamCtx:      streamCtx,
+		closeStreams:   closeStreams,
 	}
 }
+
+// CloseStreams ends every open console and VM watch stream. It is meant
+// for http.Server.RegisterOnShutdown: those handlers would otherwise hold
+// graceful shutdown open until its timeout.
+func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()

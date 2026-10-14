@@ -184,6 +184,9 @@ func run() error {
 	go purgeSessions(ctx, st)
 
 	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	// When shutdown starts, end the long-lived streams at once so they do
+	// not hold it open; ordinary in-flight requests are left to finish.
+	httpSrv.RegisterOnShutdown(srv.CloseStreams)
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		return err
@@ -195,15 +198,15 @@ func run() error {
 var shutdownTimeout = 10 * time.Second
 
 // serveHTTP serves on ln until ctx ends, then shuts down gracefully and
-// waits for that to finish. Request contexts derive from ctx (BaseContext),
-// so cancellation ends long-lived handlers such as the VM watch streams at
-// once: without it Shutdown would wait on them until the timeout, and
-// without waiting for Shutdown here the process would exit mid-request as
-// soon as the listener closed.
+// waits for that to finish. Request contexts are deliberately not tied to
+// ctx: ordinary in-flight requests (creates, uploads, redeems) must be
+// allowed to finish their writes during the drain. Only the long-lived
+// streams are cut at shutdown, via the RegisterOnShutdown hook; without
+// waiting for Shutdown here the process would exit mid-request as soon as
+// the listener closed.
 func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	srv.BaseContext = func(net.Listener) context.Context { return ctx }
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

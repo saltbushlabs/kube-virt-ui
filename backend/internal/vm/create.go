@@ -196,7 +196,13 @@ func checkImportURL(raw string) error {
 	// host; strip it before comparing.
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if !ip.IsGlobalUnicast() || ip.IsPrivate() || cgnat.Contains(ip.Unmap()) || zeroNet.Contains(ip.Unmap()) {
+		if !isPublicIP(ip) {
+			return invalid("image URLs must point at a public host")
+		}
+		// Transition mechanisms embed an IPv4 address that is what will
+		// actually be reached (IPv4-mapped, NAT64, 6to4); it must pass
+		// the same test, since the outer address looks globally routable.
+		if v4, ok := embeddedIPv4(ip); ok && !isPublicIP(v4) {
 			return invalid("image URLs must point at a public host")
 		}
 		return nil
@@ -216,9 +222,35 @@ func checkImportURL(raw string) error {
 }
 
 var (
-	cgnat   = netip.MustParsePrefix("100.64.0.0/10")
-	zeroNet = netip.MustParsePrefix("0.0.0.0/8") // "this host" range; Linux routes it to loopback
+	cgnat      = netip.MustParsePrefix("100.64.0.0/10")
+	zeroNet    = netip.MustParsePrefix("0.0.0.0/8") // "this host" range; Linux routes it to loopback
+	nat64WK    = netip.MustParsePrefix("64:ff9b::/96")
+	nat64Local = netip.MustParsePrefix("64:ff9b:1::/48")
+	sixToFour  = netip.MustParsePrefix("2002::/16")
 )
+
+func isPublicIP(ip netip.Addr) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !cgnat.Contains(ip.Unmap()) && !zeroNet.Contains(ip.Unmap())
+}
+
+// embeddedIPv4 extracts the IPv4 address carried by an IPv4-mapped, NAT64
+// (well-known or local-use prefix) or 6to4 address.
+func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
+	if ip.Is4() {
+		return netip.Addr{}, false
+	}
+	if ip.Is4In6() {
+		return ip.Unmap(), true
+	}
+	b := ip.As16()
+	switch {
+	case nat64WK.Contains(ip), nat64Local.Contains(ip):
+		return netip.AddrFrom4([4]byte(b[12:])), true
+	case sixToFour.Contains(ip):
+		return netip.AddrFrom4([4]byte(b[2:6])), true
+	}
+	return netip.Addr{}, false
+}
 
 func isNumericLabel(s string) bool {
 	if s == "" {

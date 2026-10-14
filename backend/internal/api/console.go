@@ -77,6 +77,8 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-s.streamCtx.Done():
+			return // server shutting down; the deferred closes end both sides
 		case <-errc:
 			msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "console closed")
 			_ = client.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second)) // best effort; closing anyway

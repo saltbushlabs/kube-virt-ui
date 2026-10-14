@@ -188,3 +188,37 @@ func TestFailureLimiterCountsInflight(t *testing.T) {
 		t.Fatal("attempt allowed after two failures")
 	}
 }
+
+func TestFailureLimiterResetAndCleanup(t *testing.T) {
+	l := NewFailureLimiter(2, time.Hour)
+	// A successful attempt leaves no entry behind.
+	if !l.Acquire("ok") {
+		t.Fatal("attempt refused")
+	}
+	l.Release("ok", false)
+	if len(l.entries) != 0 {
+		t.Fatalf("successful attempt left entries: %v", l.entries)
+	}
+
+	// Reset (a successful login) must not lose other in-flight attempts:
+	// they still count towards the limit, and a later failure is recorded.
+	if !l.Acquire("k") {
+		t.Fatal("first attempt refused")
+	}
+	if !l.Acquire("k") {
+		t.Fatal("second attempt refused")
+	}
+	l.Reset("k")
+	if l.Acquire("k") {
+		t.Fatal("in-flight attempts forgotten by Reset")
+	}
+	l.Release("k", false) // the successful attempt itself
+	l.Release("k", true)  // the other in-flight attempt fails
+	if e := l.entries["k"]; e == nil || e.count != 1 || e.inflight != 0 {
+		t.Fatalf("failure after Reset not recorded: %+v", e)
+	}
+	l.Reset("k")
+	if len(l.entries) != 0 {
+		t.Fatalf("Reset with nothing in flight left entries: %v", l.entries)
+	}
+}

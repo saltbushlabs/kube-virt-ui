@@ -109,6 +109,16 @@ export function CreateVMPage() {
 
   async function submit(e: FormEvent) {
     e.preventDefault()
+    // The size fields are text so they can be emptied while typing; make
+    // sure they hold a positive number before building "Gi"/"Mi" strings.
+    if (persistent && !(Number(diskSize) > 0)) {
+      setError('Enter a disk size')
+      return
+    }
+    if (sizeMode === 'custom' && !(Number(memory) > 0)) {
+      setError('Enter a memory size')
+      return
+    }
     const req: CreateVMRequest = {
       name,
       diskSource,

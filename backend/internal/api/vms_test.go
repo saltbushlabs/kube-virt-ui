@@ -202,6 +202,40 @@ listed:
 	}
 }
 
+// CloseStreams (wired to http.Server.RegisterOnShutdown in main) ends an
+// open watch stream so graceful shutdown is not held up by it, without
+// cancelling ordinary request contexts.
+func TestWatchVMsEndsOnCloseStreams(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, link, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	alice := e.client()
+	e.redeem(alice, link, "alice")
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/namespaces/team-a/watch/vms", nil)
+	req.Header.Set("X-Requested-With", "kvui")
+	resp, err := alice.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("watch: %d", resp.StatusCode)
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		close(done)
+	}()
+	e.api.CloseStreams()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch stream stayed open after CloseStreams")
+	}
+}
+
 func TestCreateVM(t *testing.T) {
 	e := newEnv(t)
 	_, link, _ := CreateInvite(context.Background(), e.store, "https://ui.test", store.Invite{

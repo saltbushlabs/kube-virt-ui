@@ -66,7 +66,9 @@ func (l *FailureLimiter) Acquire(key string) bool {
 }
 
 // Release ends an attempt Acquired earlier; a failed attempt counts
-// towards the limit. Releasing a key that was Reset meanwhile is a no-op.
+// towards the limit. An entry left with nothing to remember (no failures,
+// nothing in flight — the successful-login case) is dropped so the map
+// only ever holds keys with failures or live attempts.
 func (l *FailureLimiter) Release(key string, failed bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -86,6 +88,10 @@ func (l *FailureLimiter) Release(key string, failed bool) {
 		if len(l.entries) > 10_000 {
 			l.sweep(time.Now())
 		}
+		return
+	}
+	if e.count == 0 && e.inflight == 0 {
+		delete(l.entries, key)
 	}
 }
 
@@ -104,10 +110,21 @@ func (l *FailureLimiter) Fail(key string) {
 	}
 }
 
+// Reset clears a key's failure count (after a successful login). Attempts
+// still in flight keep counting towards the limit; their Release drops
+// the entry once the last one finishes without failing.
 func (l *FailureLimiter) Reset(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.entries, key)
+	e, ok := l.entries[key]
+	if !ok {
+		return
+	}
+	if e.inflight == 0 {
+		delete(l.entries, key)
+		return
+	}
+	e.count = 0
 }
 
 func (l *FailureLimiter) sweep(now time.Time) {

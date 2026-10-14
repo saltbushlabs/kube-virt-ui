@@ -63,6 +63,32 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 		internalError(w, r, err)
 		return userClients{}, false
 	}
+	// UserConfig may just have (re)provisioned the ServiceAccount. If the
+	// membership was removed after the check above, that would resurrect
+	// it with no member behind it; re-check and undo in that case.
+	m2, err := s.Store.Membership(r.Context(), u.ID, ns)
+	if errors.Is(err, store.ErrNotFound) {
+		_ = s.Tenants.Remove(r.Context(), ns, u.ID) // best effort; access is denied regardless
+		writeError(w, http.StatusForbidden, "not a member of this namespace")
+		return userClients{}, false
+	}
+	if err != nil {
+		internalError(w, r, err)
+		return userClients{}, false
+	}
+	if m2.Role != m.Role {
+		// The role changed under us; apply the current one before acting.
+		m = m2
+		cfg, err = s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
+		if errors.Is(err, tenant.ErrNotTenant) {
+			writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
+			return userClients{}, false
+		}
+		if err != nil {
+			internalError(w, r, err)
+			return userClients{}, false
+		}
+	}
 	kube, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		internalError(w, r, err)
@@ -172,6 +198,8 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), watchMaxDuration)
 	defer cancel()
+	// End with the server's streams (shutdown) as well as with the request.
+	defer context.AfterFunc(s.streamCtx, cancel)()
 	changes, err := vm.Watch(ctx, c.dyn, c.namespace)
 	if err != nil {
 		kubeError(w, r, err)

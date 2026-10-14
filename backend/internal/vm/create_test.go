@@ -39,6 +39,11 @@ func TestValidate(t *testing.T) {
 		"hex ipv4":               func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0x7f.1/a.img" },
 		"ipv6 loopback":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::1]/a.img" },
 		"ipv6 zone":              func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[fe80::1%25eth0]/a.img" },
+		"ipv4-mapped loopback":   func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:127.0.0.1]/a.img" },
+		"ipv4-mapped private":    func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:10.0.0.1]/a.img" },
+		"nat64 loopback":         func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b::7f00:1]/a.img" },
+		"nat64 private":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b:1::a00:1]/a.img" },
+		"6to4 loopback":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[2002:7f00:1::1]/a.img" },
 		"long name with dv":      func(r *CreateRequest) { r.Name = strings.Repeat("a", 59) },
 		"bad ssh key":            func(r *CreateRequest) { r.SSHKeys = []string{"hello"} },
 		"multiline key":          func(r *CreateRequest) { r.SSHKeys = []string{"ssh-ed25519 AAAA\nruncmd"} },
@@ -65,7 +70,8 @@ func TestValidate(t *testing.T) {
 		t.Fatalf("public http rejected: %v", err)
 	}
 	// Public IP literals, FQDN trailing dots and digit-leading labels are fine.
-	for _, u := range []string{"https://8.8.8.8/a.img", "https://example.com./a.img", "https://3.example.com/a.img"} {
+	for _, u := range []string{"https://8.8.8.8/a.img", "https://example.com./a.img", "https://3.example.com/a.img",
+		"https://[::ffff:808:808]/a.img", "https://[64:ff9b::808:808]/a.img", "https://[2002:808:808::1]/a.img"} {
 		h := valid()
 		h.DiskSource, h.DiskURL = SourceHTTP, u
 		if err := h.Validate(); err != nil {

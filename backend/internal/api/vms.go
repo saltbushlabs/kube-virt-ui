@@ -45,40 +45,26 @@ type userClients struct {
 // itself on failure.
 func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients, bool) {
 	u, ns := currentUser(r), chi.URLParam(r, "ns")
-	m, err := s.Store.Membership(r.Context(), u.ID, ns)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusForbidden, "not a member of this namespace")
-		return userClients{}, false
-	}
-	if err != nil {
-		internalError(w, r, err)
-		return userClients{}, false
-	}
-	cfg, err := s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
-	if errors.Is(err, tenant.ErrNotTenant) {
-		writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
-		return userClients{}, false
-	}
-	if err != nil {
-		internalError(w, r, err)
-		return userClients{}, false
-	}
-	// UserConfig may just have (re)provisioned the ServiceAccount. If the
-	// membership was removed after the check above, that would resurrect
-	// it with no member behind it; re-check and undo in that case.
-	m2, err := s.Store.Membership(r.Context(), u.ID, ns)
-	if errors.Is(err, store.ErrNotFound) {
-		_ = s.Tenants.Remove(r.Context(), ns, u.ID) // best effort; access is denied regardless
-		writeError(w, http.StatusForbidden, "not a member of this namespace")
-		return userClients{}, false
-	}
-	if err != nil {
-		internalError(w, r, err)
-		return userClients{}, false
-	}
-	if m2.Role != m.Role {
-		// The role changed under us; apply the current one before acting.
-		m = m2
+	// UserConfig may (re)provision the ServiceAccount, so the membership
+	// is read again afterwards: if it was removed in between, undo the
+	// provisioning and refuse, rather than resurrecting a ServiceAccount
+	// with no member behind it. A role changed in between is applied by
+	// going round again, so the clients returned always match a
+	// membership read taken after the last provisioning. The loop only
+	// repeats while an admin keeps changing the role mid-request.
+	var m store.Membership
+	var cfg *rest.Config
+	for {
+		var err error
+		m, err = s.Store.Membership(r.Context(), u.ID, ns)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusForbidden, "not a member of this namespace")
+			return userClients{}, false
+		}
+		if err != nil {
+			internalError(w, r, err)
+			return userClients{}, false
+		}
 		cfg, err = s.Tenants.UserConfig(r.Context(), ns, u.ID, u.Username, m.Role)
 		if errors.Is(err, tenant.ErrNotTenant) {
 			writeError(w, http.StatusForbidden, "namespace is no longer a kubevirt-ui tenant")
@@ -87,6 +73,23 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 		if err != nil {
 			internalError(w, r, err)
 			return userClients{}, false
+		}
+		m2, err := s.Store.Membership(r.Context(), u.ID, ns)
+		if errors.Is(err, store.ErrNotFound) {
+			// Best effort, and not tied to this connection: a client that
+			// has already gone away must not cancel the cleanup.
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+			_ = s.Tenants.Remove(cleanup, ns, u.ID)
+			cancel()
+			writeError(w, http.StatusForbidden, "not a member of this namespace")
+			return userClients{}, false
+		}
+		if err != nil {
+			internalError(w, r, err)
+			return userClients{}, false
+		}
+		if m2.Role == m.Role {
+			break
 		}
 	}
 	kube, err := kubernetes.NewForConfig(cfg)

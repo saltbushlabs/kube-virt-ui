@@ -234,7 +234,13 @@ func isPublicIP(ip netip.Addr) bool {
 }
 
 // embeddedIPv4 extracts the IPv4 address carried by an IPv4-mapped, NAT64
-// (well-known or local-use prefix) or 6to4 address.
+// (well-known or local-use prefix) or 6to4 address. The NAT64 extraction
+// reads the last 32 bits, which is where a /96 prefix puts the address;
+// the well-known prefix is always /96, and the local-use prefix is most
+// commonly deployed that way too, but RFC 6052 allows other prefix
+// lengths that place the address elsewhere. Those are not decoded — this
+// check is defence in depth behind the importer NetworkPolicy, not the
+// boundary itself.
 func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
 	if ip.Is4() {
 		return netip.Addr{}, false

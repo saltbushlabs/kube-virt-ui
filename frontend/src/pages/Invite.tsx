@@ -108,10 +108,16 @@ export function InvitePage() {
   if (step === 'account') {
     const submit = (e: FormEvent) => {
       e.preventDefault()
-      // Mirrors the backend's MinPasswordLen/MaxPasswordLen so both are
-      // caught here instead of at redeem time, after the QR scan.
-      if (password.length < 12 || password.length > 256) {
-        setError('Password must be between 12 and 256 characters')
+      // Mirrors the backend's limits so both are caught here instead of
+      // at redeem time, after the QR scan: at least 12 characters, and at
+      // most 256 UTF-8 *bytes* (the backend counts bytes, so measure with
+      // TextEncoder, not String.length).
+      if ([...password].length < 12) {
+        setError('Password must be at least 12 characters')
+        return
+      }
+      if (new TextEncoder().encode(password).length > 256) {
+        setError('Password is too long (at most 256 bytes in UTF-8; accented and non-Latin characters count for more than one)')
         return
       }
       if (password !== confirm) {

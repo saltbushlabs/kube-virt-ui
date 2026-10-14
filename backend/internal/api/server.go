@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -273,9 +274,21 @@ func (s *Server) audit(r *http.Request, actor *store.User, action, namespace, ta
 
 // provision applies a membership to Kubernetes. Failures are logged rather
 // than returned where the membership is already committed: UserConfig
-// reprovisions on first use, so the user is not left stuck.
+// reprovisions on first use, so the user is not left stuck. The membership
+// is re-checked either side of Ensure so a removal racing this call (the
+// admin path removes the Kubernetes objects, deletes the row, then
+// removes again) cannot leave a ServiceAccount behind with no member.
 func (s *Server) provision(ctx context.Context, u store.User, namespace, role string) {
+	if _, err := s.Store.Membership(ctx, u.ID, namespace); err != nil {
+		return // gone (or unreadable) already; nothing to apply
+	}
 	if err := s.Tenants.Ensure(ctx, namespace, u.ID, u.Username, role); err != nil {
 		slog.Error("provision membership", "user", u.Username, "namespace", namespace, "err", err)
+		return
+	}
+	if _, err := s.Store.Membership(ctx, u.ID, namespace); errors.Is(err, store.ErrNotFound) {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = s.Tenants.Remove(cleanup, namespace, u.ID)
 	}
 }

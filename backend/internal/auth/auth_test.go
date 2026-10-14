@@ -46,6 +46,18 @@ func TestPassword(t *testing.T) {
 	if _, err := HashPassword(ctx, strings.Repeat("x", MaxPasswordLen+1)); err != ErrPasswordTooLong {
 		t.Fatalf("want ErrPasswordTooLong, got %v", err)
 	}
+	// The minimum counts characters, the maximum bytes: four CJK
+	// characters are twelve bytes but only four characters, and one
+	// hundred are three hundred bytes.
+	if _, err := HashPassword(ctx, strings.Repeat("漢", 4)); err != ErrWeakPassword {
+		t.Fatalf("short multibyte password: want ErrWeakPassword, got %v", err)
+	}
+	if _, err := HashPassword(ctx, strings.Repeat("漢", 100)); err != ErrPasswordTooLong {
+		t.Fatalf("long multibyte password: want ErrPasswordTooLong, got %v", err)
+	}
+	if _, err := HashPassword(ctx, strings.Repeat("漢", 12)); err != nil {
+		t.Fatalf("12-character multibyte password rejected: %v", err)
+	}
 	h, err := HashPassword(ctx, "correct horse battery")
 	if err != nil {
 		t.Fatal(err)

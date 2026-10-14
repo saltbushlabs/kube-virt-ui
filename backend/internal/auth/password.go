@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -22,9 +23,10 @@ const (
 	argonKeyLen  = 32
 	argonSaltLen = 16
 
+	// MinPasswordLen is counted in characters (runes); MaxPasswordLen in
+	// bytes, since it bounds the input an unauthenticated caller can make
+	// the server hash. Real passwords and passphrases are far below it.
 	MinPasswordLen = 12
-	// MaxPasswordLen bounds the input an unauthenticated caller can make
-	// the server hash; real passwords and passphrases are far below it.
 	MaxPasswordLen = 256
 
 	// maxConcurrentHashes bounds Argon2 memory to this many times
@@ -45,7 +47,7 @@ var (
 // ErrHashBusy reports that every hash slot and queue place is taken.
 var ErrHashBusy = errors.New("password hashing is busy, try again shortly")
 
-var ErrPasswordTooLong = fmt.Errorf("password must be at most %d characters", MaxPasswordLen)
+var ErrPasswordTooLong = fmt.Errorf("password must be at most %d bytes", MaxPasswordLen)
 
 // idKey is argon2.IDKey limited to maxConcurrentHashes at a time, with at
 // most maxQueuedHashes callers waiting. A caller whose ctx ends while it
@@ -71,7 +73,7 @@ var ErrWeakPassword = fmt.Errorf("password must be at least %d characters", MinP
 
 // HashPassword returns a PHC-formatted Argon2id hash.
 func HashPassword(ctx context.Context, password string) (string, error) {
-	if len(password) < MinPasswordLen {
+	if utf8.RuneCountInString(password) < MinPasswordLen {
 		return "", ErrWeakPassword
 	}
 	if len(password) > MaxPasswordLen {

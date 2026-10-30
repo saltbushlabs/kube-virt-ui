@@ -11,7 +11,7 @@ permissions:
 
 env:
   GOVULNCHECK_VERSION: v1.6.0
-  GOSEC_VERSION: v2.29.0
+  GOSEC_VERSION: v2.30.0
   GOLANGCI_LINT_VERSION: v2.14.0
 
 jobs:

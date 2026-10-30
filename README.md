@@ -124,7 +124,7 @@ Dockerfile  builds both into one distroless image (published by .github/workflow
 ## Install
 
 Images for `linux/amd64` and `linux/arm64` are published to
-`ghcr.io/samfaunt/kube-virt-ui` by GitHub Actions
+`ghcr.io/saltbushlabs/kube-virt-ui` by GitHub Actions
 (`.github/workflows/image.yml`):
 
 - `:main` and `:sha-<commit>` for every push to `main`.

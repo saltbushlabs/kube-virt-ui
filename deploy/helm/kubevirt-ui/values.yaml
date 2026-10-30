@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/samfaunt/kube-virt-ui
+  repository: ghcr.io/saltbushlabs/kube-virt-ui
   tag: ""          # defaults to .Chart.AppVersion; published for each v* git tag
   pullPolicy: IfNotPresent
 

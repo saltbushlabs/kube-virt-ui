@@ -11,6 +11,8 @@ import (
 	"github.com/gorilla/websocket"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/rest"
 )
 
@@ -25,6 +27,11 @@ func DialConsole(ctx context.Context, cfg *rest.Config, namespace, name, kind st
 	if !ConsoleKinds[kind] {
 		return nil, fmt.Errorf("unknown console kind %q", kind)
 	}
+	// name comes from the request path; JoinPath resolves "..", so anything
+	// but a valid object name could escape the tenant's namespace.
+	if len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "kubevirt.io", Resource: "virtualmachineinstances"}, name)
+	}
 	u, err := url.Parse(cfg.Host)
 	if err != nil {
 		return nil, err
@@ -35,7 +42,7 @@ func DialConsole(ctx context.Context, cfg *rest.Config, namespace, name, kind st
 	case "http":
 		u.Scheme = "ws"
 	}
-	u = u.JoinPath("/apis/subresources.kubevirt.io/v1/namespaces", namespace, "virtualmachineinstances", name, kind)
+	u = u.JoinPath("/apis/subresources.kubevirt.io/v1/namespaces", namespace, "virtualmachineinstances", name, kind) // #nosec G125 -- kind is allowlisted, name validated above
 
 	tlsConfig, err := rest.TLSConfigFor(cfg)
 	if err != nil {

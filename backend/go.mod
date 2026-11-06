@@ -6,10 +6,10 @@ require (
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	golang.org/x/crypto v0.58.0
-	k8s.io/api v0.37.1
-	k8s.io/apimachinery v0.37.1
-	k8s.io/client-go v0.37.1
-	modernc.org/sqlite v1.61.0
+	k8s.io/api v0.37.2
+	k8s.io/apimachinery v0.37.2
+	k8s.io/client-go v0.37.2
+	modernc.org/sqlite v1.61.1
 )
 
 require (

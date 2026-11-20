@@ -165,12 +165,16 @@ clusters) in every tenant namespace. VMs attach to the default pod network in
 masquerade mode, so without an egress policy on `virt-launcher` pods, any user
 with console or SSH access to a VM can reach cloud metadata
 (`169.254.169.254`) and cluster-internal services. The example policy allows
-DNS, same-namespace pod traffic and public IPv4 internet only, excluding
-private, CGNAT, link-local/metadata, loopback and `0.0.0.0/8` ranges (add any
-custom pod or service CIDRs to its `except` list; IPv6 egress is denied by
-omission). Whether launcher-pod egress is enforced depends on the CNI applying
-NetworkPolicy to masquerade-mode pod traffic (e.g. Cilium or Calico); verify
-enforcement on your cluster.
+DNS, same-namespace pod traffic (it does not isolate VMs from other pods in
+the same tenant namespace) and public IPv4 internet only, excluding private,
+CGNAT, link-local/metadata, loopback and `0.0.0.0/8` ranges (add any custom
+pod or service CIDRs to its `except` list; IPv6 egress is denied by omission).
+Both `importer-egress` and `vm-egress` also allow port 53 to `169.254.20.10/32`
+for clusters running NodeLocal DNSCache (adjust that IP if your cluster uses a
+different local-DNS address, or remove it if unused). Whether launcher-pod
+egress is enforced depends on the CNI applying NetworkPolicy to
+masquerade-mode pod traffic (e.g. Cilium or Calico); verify enforcement on
+your cluster.
 
 ## Develop
 

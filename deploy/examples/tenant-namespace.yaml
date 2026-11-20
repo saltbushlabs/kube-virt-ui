@@ -85,7 +85,9 @@ spec:
 # resolve or redirect to internal addresses. The except list covers RFC 1918,
 # CGNAT, link-local/metadata, loopback and 0.0.0.0/8; if your pod or service
 # CIDRs fall outside these, add them. No IPv6 rule is given, so IPv6 egress
-# is denied.
+# is denied. The 169.254.20.10/32 port-53 rule supports default NodeLocal
+# DNSCache (adjust the IP if your cluster uses another address, or remove it
+# if you do not run NodeLocal DNSCache).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -104,6 +106,8 @@ spec:
       podSelector:
         matchLabels:
           k8s-app: kube-dns
+    - ipBlock:
+        cidr: 169.254.20.10/32  # NodeLocal DNSCache default IP; adjust or remove if unused
     ports:
     - {protocol: UDP, port: 53}
     - {protocol: TCP, port: 53}
@@ -122,11 +126,15 @@ spec:
 # VMs attach to the default pod network with masquerade, so without an egress
 # policy any user with console or SSH access to a VM can reach cloud metadata
 # (169.254.169.254) and cluster-internal services. Allow DNS, same-namespace
-# pod traffic (so VMs in this tenant can reach each other) and public internet
-# only. The except list covers RFC 1918, CGNAT, link-local/metadata, loopback
-# and 0.0.0.0/8; if your pod or service CIDRs fall outside these, add them. No
-# IPv6 rule is given, so IPv6 egress is denied. Enforcement on masquerade-mode
-# VM traffic depends on the CNI (e.g. Cilium or Calico).
+# pod traffic and public internet only. Note that the same-namespace rule
+# (podSelector: {}) permits traffic to every port on every pod in this
+# namespace (including other VMs and CDI importer/upload-server pods), so this
+# policy does not isolate VMs from each other within a tenant. The except list
+# covers RFC 1918, CGNAT, link-local/metadata, loopback and 0.0.0.0/8; if your
+# pod or service CIDRs fall outside these, add them. No IPv6 rule is given, so
+# IPv6 egress is denied. The 169.254.20.10/32 port-53 rule supports default
+# NodeLocal DNSCache (adjust or remove if unused). Enforcement on
+# masquerade-mode VM traffic depends on the CNI (e.g. Cilium or Calico).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -145,6 +153,8 @@ spec:
       podSelector:
         matchLabels:
           k8s-app: kube-dns
+    - ipBlock:
+        cidr: 169.254.20.10/32  # NodeLocal DNSCache default IP; adjust or remove if unused
     ports:
     - {protocol: UDP, port: 53}
     - {protocol: TCP, port: 53}

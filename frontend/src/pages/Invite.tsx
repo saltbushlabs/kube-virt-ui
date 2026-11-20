@@ -33,8 +33,13 @@ function describe(info: InviteInfo) {
 
 export function InvitePage() {
   const { token = '' } = useParams()
+  return <InviteFlow key={token} token={token} />
+}
+
+function InviteFlow({ token }: { token: string }) {
   const { me, loading, refresh } = useSession()
   const navigate = useNavigate()
+  const encodedToken = encodeURIComponent(token)
   const [info, setInfo] = useState<InviteInfo | null>(null)
   const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
@@ -49,8 +54,17 @@ export function InvitePage() {
   const [recovery, setRecovery] = useState<string[]>([])
 
   useEffect(() => {
-    api<InviteInfo>('GET', `/invites/${token}`).then(setInfo, (e) => setLoadError(e.message))
-  }, [token])
+    const ac = new AbortController()
+    api<InviteInfo>('GET', `/invites/${encodedToken}`, undefined, ac.signal).then(
+      (data) => {
+        if (!ac.signal.aborted) setInfo(data)
+      },
+      (e) => {
+        if (!ac.signal.aborted) setLoadError((e as Error).message)
+      },
+    )
+    return () => ac.abort()
+  }, [encodedToken])
 
   async function run(fn: () => Promise<void>) {
     setBusy(true)
@@ -93,7 +107,7 @@ export function InvitePage() {
           isDisabled={busy}
           onClick={() =>
             run(async () => {
-              await api('POST', `/invites/${token}/accept`)
+              await api('POST', `/invites/${encodedToken}/accept`)
               await refresh()
               navigate('/')
             })
@@ -125,7 +139,7 @@ export function InvitePage() {
         return
       }
       run(async () => {
-        const res = await api<{ secret: string; uri: string }>('POST', `/invites/${token}/totp`, { username })
+        const res = await api<{ secret: string; uri: string }>('POST', `/invites/${encodedToken}/totp`, { username })
         setTotp({ secret: res.secret, qr: await QRCode.toDataURL(res.uri) })
         setStep('totp')
       })
@@ -155,7 +169,7 @@ export function InvitePage() {
             </Button>
           </ActionGroup>
           <Content component="small">
-            Already have an account? <Link to={`/login?next=/invite/${token}`}>Log in to accept</Link>
+            Already have an account? <Link to={`/login?next=${encodeURIComponent(`/invite/${encodedToken}`)}`}>Log in to accept</Link>
           </Content>
         </Form>
       </AuthCard>
@@ -166,7 +180,7 @@ export function InvitePage() {
     const submit = (e: FormEvent) => {
       e.preventDefault()
       run(async () => {
-        const res = await api<{ recoveryCodes: string[] }>('POST', `/invites/${token}/redeem`, { username, password, code })
+        const res = await api<{ recoveryCodes: string[] }>('POST', `/invites/${encodedToken}/redeem`, { username, password, code })
         setRecovery(res.recoveryCodes)
         setStep('recovery')
       })
@@ -191,7 +205,14 @@ export function InvitePage() {
             <Button type="submit" isBlock isLoading={busy} isDisabled={busy}>
               Create account
             </Button>
-            <Button variant="link" onClick={() => setStep('account')}>
+            <Button
+              variant="link"
+              isDisabled={busy}
+              onClick={() => {
+                setError('')
+                setStep('account')
+              }}
+            >
               Back
             </Button>
           </ActionGroup>
@@ -202,6 +223,7 @@ export function InvitePage() {
 
   return (
     <AuthCard title="Save your recovery codes">
+      {error && <Alert variant="danger" isInline title={error} style={{ marginBottom: 16 }} />}
       <Alert variant="warning" isInline title="These codes are shown only once">
         Each code can be used once instead of an authenticator code if you lose your device. Store them somewhere safe.
       </Alert>
@@ -215,11 +237,15 @@ export function InvitePage() {
       </ClipboardCopy>
       <Button
         isBlock
+        isLoading={busy}
+        isDisabled={busy}
         style={{ marginTop: 16 }}
-        onClick={async () => {
-          await refresh()
-          navigate('/')
-        }}
+        onClick={() =>
+          run(async () => {
+            await refresh()
+            navigate('/')
+          })
+        }
       >
         I have saved them
       </Button>

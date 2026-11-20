@@ -76,11 +76,11 @@ func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer, securityHeaders)
+	r.Use(middleware.Recoverer, s.securityHeaders)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	r.Route("/api", func(r chi.Router) {
-		r.Use(requireCSRFHeader)
+		r.Use(noStore, requireCSRFHeader)
 		r.Post("/login", s.login)
 		r.Post("/logout", s.logout)
 		r.Get("/invites/{token}", s.getInvite)
@@ -128,13 +128,23 @@ func (s *Server) Handler() http.Handler {
 	return r
 }
 
-func securityHeaders(next http.Handler) http.Handler {
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		// Invite tokens live in the URL path; never leak them via Referer.
 		h.Set("Referrer-Policy", "no-referrer")
+		if s.SecureCookies {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
 }

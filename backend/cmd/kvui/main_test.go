@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
@@ -120,5 +122,67 @@ func TestServeHTTPShutdownDrainsRequests(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("serveHTTP did not return after draining")
+	}
+}
+
+func TestLoadConfigPublicURL(t *testing.T) {
+	validKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+
+	setBase := func(t *testing.T, publicURL string) {
+		t.Helper()
+		t.Setenv("KVUI_SECRET_KEY", validKey)
+		t.Setenv("KVUI_PUBLIC_URL", publicURL)
+		t.Setenv("KVUI_INSECURE_COOKIES", "")
+		t.Setenv("KVUI_TRUST_PROXY", "")
+		t.Setenv("KVUI_TRUSTED_PROXIES", "")
+	}
+
+	for _, valid := range []string{
+		"https://vms.example.com",
+		"http://localhost:5173",
+		"HTTPS://vms.example.com:8443/sub",
+		"https://[::1]:8443",
+	} {
+		t.Run("valid/"+valid, func(t *testing.T) {
+			setBase(t, valid)
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatalf("loadConfig(%q): unexpected error: %v", valid, err)
+			}
+			if cfg.publicURL != valid {
+				t.Fatalf("publicURL = %q, want %q", cfg.publicURL, valid)
+			}
+		})
+	}
+
+	for _, invalid := range []string{
+		"",
+		"vms.example.com",
+		"ftp://vms.example.com",
+		"javascript:alert(1)",
+		"https://",
+		"https:///path",
+		"https://:8080",
+		"://bad",
+	} {
+		t.Run("invalid/"+invalid, func(t *testing.T) {
+			setBase(t, invalid)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig(%q): expected error, got nil", invalid)
+			}
+		})
+	}
+}
+
+func TestNewHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer(":8080", http.NotFoundHandler())
+	if srv.Addr != ":8080" {
+		t.Errorf("Addr = %q, want :8080", srv.Addr)
+	}
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 10s", srv.ReadHeaderTimeout)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Errorf("IdleTimeout = %v, want 120s", srv.IdleTimeout)
 	}
 }

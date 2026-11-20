@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -75,6 +76,10 @@ func loadConfig() (config, error) {
 	}
 	if c.publicURL == "" {
 		return c, errors.New("KVUI_PUBLIC_URL is required (used in invite links)")
+	}
+	u, err := url.Parse(c.publicURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" {
+		return c, errors.New("KVUI_PUBLIC_URL must be a valid http:// or https:// URL with a host")
 	}
 	c.secretKey, err = base64.StdEncoding.DecodeString(os.Getenv("KVUI_SECRET_KEY"))
 	if err != nil || len(c.secretKey) != 32 {
@@ -183,7 +188,7 @@ func run() error {
 	defer stop()
 	go purgeSessions(ctx, st)
 
-	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := newHTTPServer(cfg.listen, srv.Handler())
 	// When shutdown starts, end the long-lived streams at once so they do
 	// not hold it open; ordinary in-flight requests are left to finish.
 	httpSrv.RegisterOnShutdown(srv.CloseStreams)
@@ -193,6 +198,15 @@ func run() error {
 	}
 	slog.Info("listening", "addr", cfg.listen)
 	return serveHTTP(ctx, ln, httpSrv)
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 var shutdownTimeout = 10 * time.Second

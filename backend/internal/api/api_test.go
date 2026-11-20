@@ -303,3 +303,86 @@ func TestLoginLockoutIsPerSource(t *testing.T) {
 		t.Fatalf("owner locked out by another source: %d", st)
 	}
 }
+
+func TestSecurityHeadersAndCacheControl(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, link, err := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := e.client()
+	e.redeem(alice, link, "alice")
+
+	// SecureCookies is false in newEnv: HSTS must not be emitted.
+	resp, err := http.Get(e.srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != "" {
+		t.Errorf("healthz HSTS with SecureCookies=false: %q", hsts)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		t.Errorf("healthz Cache-Control = %q, want empty", cc)
+	}
+
+	// API responses get Cache-Control: no-store, including CSRF errors.
+	resp, err = http.Post(e.srv.URL+"/api/login", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("login CSRF refusal Cache-Control = %q, want no-store", cc)
+	}
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/me", nil)
+	resp, err = alice.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("/api/me Cache-Control = %q, want no-store", cc)
+	}
+	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != "" {
+		t.Errorf("/api/me HSTS with SecureCookies=false: %q", hsts)
+	}
+
+	// SSE watch endpoint keeps no-cache alongside no-store.
+	req, _ = http.NewRequest("GET", e.srv.URL+"/api/namespaces/team-a/watch/vms", nil)
+	resp, err = alice.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache, no-store" {
+		t.Errorf("watch/vms Cache-Control = %q, want %q", cc, "no-cache, no-store")
+	}
+	e.api.CloseStreams()
+	resp.Body.Close()
+
+	// SecureCookies=true emits HSTS on all responses.
+	e.api.SecureCookies = true
+	resp, err = http.Get(e.srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	const wantHSTS = "max-age=31536000; includeSubDomains"
+	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != wantHSTS {
+		t.Errorf("healthz HSTS with SecureCookies=true = %q, want %q", hsts, wantHSTS)
+	}
+	resp, err = http.Get(e.srv.URL + "/api/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != wantHSTS {
+		t.Errorf("/api/me HSTS with SecureCookies=true = %q, want %q", hsts, wantHSTS)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("/api/me Cache-Control = %q, want no-store", cc)
+	}
+}

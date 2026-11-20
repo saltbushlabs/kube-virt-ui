@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
@@ -111,6 +113,12 @@ func TestConsoleProxy(t *testing.T) {
 	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"https://evil.test"}}); err == nil || resp.StatusCode != 403 {
 		t.Fatalf("cross-origin handshake accepted: %v", err)
 	}
+	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"http://ui.test"}}); err == nil || resp.StatusCode != 403 {
+		t.Fatalf("scheme-mismatched PublicURL handshake accepted: %v", err)
+	}
+	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"https://" + strings.TrimPrefix(e.srv.URL, "http://")}}); err == nil || resp.StatusCode != 403 {
+		t.Fatalf("scheme-mismatched host handshake accepted: %v", err)
+	}
 	if _, resp, err := dialer.Dial(base+"off/vnc", sameOrigin); err == nil || resp.StatusCode != 404 {
 		t.Fatalf("upstream refusal not relayed: %v", err)
 	}
@@ -138,5 +146,141 @@ func TestConsoleProxy(t *testing.T) {
 	_, _, err = conn.ReadMessage()
 	if !websocket.IsCloseError(err, websocket.ClosePolicyViolation) {
 		t.Fatalf("console not closed on revocation: %v", err)
+	}
+}
+
+func TestSameOrigin(t *testing.T) {
+	cases := []struct {
+		name          string
+		publicURL     string
+		secureCookies bool
+		tls           bool
+		host          string
+		origin        string
+		want          bool
+	}{
+		{
+			name:          "public url exact match",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "kvui.internal:8080",
+			origin:        "https://ui.test",
+			want:          true,
+		},
+		{
+			name:          "public url case-insensitive scheme and host",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "kvui.internal:8080",
+			origin:        "HTTPS://UI.TEST",
+			want:          true,
+		},
+		{
+			name:          "public url scheme mismatch http vs https",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "kvui.internal:8080",
+			origin:        "http://ui.test",
+			want:          false,
+		},
+		{
+			name:          "secure cookies rejects http even matching host",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "ui.test",
+			origin:        "http://ui.test",
+			want:          false,
+		},
+		{
+			name:          "secure cookies accepts https matching host behind tls ingress",
+			publicURL:     "https://other.test",
+			secureCookies: true,
+			host:          "ui.test",
+			origin:        "https://ui.test",
+			want:          true,
+		},
+		{
+			name:          "secure cookies rejects http public url",
+			publicURL:     "http://ui.test",
+			secureCookies: true,
+			host:          "kvui.internal:8080",
+			origin:        "http://ui.test",
+			want:          false,
+		},
+		{
+			name:          "insecure plain http host match",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "http://localhost:8080",
+			want:          true,
+		},
+		{
+			name:          "insecure plain http rejects https host mismatch",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "https://localhost:8080",
+			want:          false,
+		},
+		{
+			name:          "direct tls accepts https host",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			tls:           true,
+			host:          "localhost:8443",
+			origin:        "https://localhost:8443",
+			want:          true,
+		},
+		{
+			name:          "direct tls rejects http host",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			tls:           true,
+			host:          "localhost:8443",
+			origin:        "http://localhost:8443",
+			want:          false,
+		},
+		{
+			name:          "missing origin rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "ui.test",
+			origin:        "",
+			want:          false,
+		},
+		{
+			name:          "schemeless origin rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "ui.test",
+			origin:        "//ui.test",
+			want:          false,
+		},
+		{
+			name:          "ws scheme rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "ws://localhost:8080",
+			want:          false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Options{PublicURL: tc.publicURL, SecureCookies: tc.secureCookies})
+			r := httptest.NewRequest(http.MethodGet, "/api/namespaces/team-a/vms/web/vnc", nil)
+			r.Host = tc.host
+			if tc.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if got := s.sameOrigin(r); got != tc.want {
+				t.Errorf("sameOrigin() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

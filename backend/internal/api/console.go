@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -24,14 +25,24 @@ var upgrader = websocket.Upgrader{
 // the X-Requested-With CSRF check does not cover them.
 func (s *Server) sameOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	if err != nil || origin.Host == "" {
+	if err != nil || origin.Host == "" || origin.Scheme == "" {
 		return false
 	}
-	if origin.Host == r.Host {
+	expectedScheme := "http"
+	if s.SecureCookies || r.TLS != nil {
+		expectedScheme = "https"
+	}
+	if strings.EqualFold(origin.Host, r.Host) && strings.EqualFold(origin.Scheme, expectedScheme) {
 		return true
 	}
 	public, err := url.Parse(s.PublicURL)
-	return err == nil && origin.Host == public.Host
+	if err != nil || public.Host == "" || public.Scheme == "" {
+		return false
+	}
+	if s.SecureCookies && !strings.EqualFold(origin.Scheme, "https") {
+		return false
+	}
+	return strings.EqualFold(origin.Host, public.Host) && strings.EqualFold(origin.Scheme, public.Scheme)
 }
 
 // console proxies the browser's websocket to KubeVirt's VNC or serial

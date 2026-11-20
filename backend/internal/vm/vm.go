@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -224,6 +225,11 @@ func Do(ctx context.Context, rc rest.Interface, namespace, name, action string) 
 		return fmt.Errorf("unknown action %q", action)
 	}
 	resourceType, verb, _ := strings.Cut(sub, "/")
+	// name comes from the request path; AbsPath joins segments with path.Join,
+	// so anything but a valid object name could escape the tenant's namespace.
+	if len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "kubevirt.io", Resource: resourceType}, name)
+	}
 	return rc.Put().
 		AbsPath("/apis/subresources.kubevirt.io/v1/namespaces", namespace, resourceType, name, verb).
 		SetHeader("Content-Type", "application/json").

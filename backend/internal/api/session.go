@@ -14,7 +14,16 @@ import (
 const (
 	sessionCookie = "kvui_session"
 	sessionTTL    = 12 * time.Hour
+
+	// maxLoginUsernameBytes caps the username accepted for rate-limiting,
+	// DB lookup and audit logging on login. Real usernames are 3-32 bytes
+	// (usernameRE), so anything longer can never match an account.
+	maxLoginUsernameBytes = 128
 )
+
+func loginUserKey(username, ipKey string) string {
+	return "user:" + strings.ToLower(truncateUTF8(username, maxLoginUsernameBytes)) + "|" + ipKey
+}
 
 type ctxKey struct{}
 
@@ -93,13 +102,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	overlongUsername := len(req.Username) > maxLoginUsernameBytes
+	boundedUser := truncateUTF8(req.Username, maxLoginUsernameBytes)
 	// Failures count per source and per (account, source). The account
 	// counter is scoped to the source so that failures from one address
 	// cannot lock the account out for everyone else (including the sole
 	// admin); distributed guessing is already impractical against Argon2id
 	// plus a required second factor.
 	ipKey := s.rateKey(r)
-	userKey := "user:" + strings.ToLower(req.Username) + "|" + ipKey
+	userKey := loginUserKey(boundedUser, ipKey)
 	// Acquire reserves the attempt before the (slow) password check, so a
 	// burst of concurrent attempts cannot all pass while none has failed
 	// yet; the deferred Release records the outcome.
@@ -122,7 +133,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	acquired = true
 
-	u, err := s.Store.UserByUsername(r.Context(), req.Username)
+	var (
+		u   store.User
+		err error
+	)
+	if overlongUsername {
+		err = store.ErrNotFound
+	} else {
+		u, err = s.Store.UserByUsername(r.Context(), req.Username)
+	}
 	ok := false
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -147,7 +166,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		failed = true
-		s.audit(r, nil, "login.failed", "", req.Username)
+		s.audit(r, nil, "login.failed", "", boundedUser)
 		writeError(w, http.StatusUnauthorized, "invalid username, password or code")
 		return
 	}

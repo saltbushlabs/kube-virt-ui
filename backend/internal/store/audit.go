@@ -23,6 +23,11 @@ func (s *Store) Audit(ctx context.Context, e AuditEntry) error {
 	return err
 }
 
+func (s *Store) PurgeAudit(ctx context.Context, before time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM audit WHERE at < ?`, unix(before))
+	return err
+}
+
 func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT at, actor_id, actor, action, namespace, target, ip FROM audit ORDER BY id DESC LIMIT ?`, limit)

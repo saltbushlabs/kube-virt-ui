@@ -133,9 +133,7 @@ func run() error {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "admin-invite":
-			now := time.Now()
-			_, link, err := api.CreateInvite(context.Background(), st, cfg.publicURL,
-				store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)})
+			link, err := createAdminInvite(context.Background(), st, cfg.publicURL, time.Now())
 			if err != nil {
 				return err
 			}
@@ -228,6 +226,34 @@ func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
 	return err
 }
 
+const auditRetention = 90 * 24 * time.Hour
+
+func createAdminInvite(ctx context.Context, st *store.Store, publicURL string, now time.Time) (string, error) {
+	_, link, err := api.CreateInvite(ctx, st, publicURL,
+		store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)})
+	if err != nil {
+		return "", err
+	}
+	if err := st.Audit(ctx, store.AuditEntry{
+		At:     now,
+		Actor:  "cli",
+		Action: "invite.create",
+		Target: "admin",
+	}); err != nil {
+		slog.Error("audit write failed", "action", "invite.create", "err", err)
+	}
+	return link, nil
+}
+
+func purgeOnce(ctx context.Context, st *store.Store, now time.Time) {
+	if err := st.PurgeExpiredSessions(ctx, now); err != nil {
+		slog.Error("purge sessions", "err", err)
+	}
+	if err := st.PurgeAudit(ctx, now.Add(-auditRetention)); err != nil {
+		slog.Error("purge audit", "err", err)
+	}
+}
+
 func purgeSessions(ctx context.Context, st *store.Store) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
@@ -236,9 +262,7 @@ func purgeSessions(ctx context.Context, st *store.Store) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := st.PurgeExpiredSessions(ctx, time.Now()); err != nil {
-				slog.Error("purge sessions", "err", err)
-			}
+			purgeOnce(ctx, st, time.Now())
 		}
 	}
 }

@@ -18,37 +18,47 @@ func TestValidate(t *testing.T) {
 		"both sizes": func(r *CreateRequest) {
 			r.Instancetype = &Ref{Name: "u1.small", Kind: "VirtualMachineClusterInstancetype"}
 		},
-		"no size":                func(r *CreateRequest) { r.CPUs, r.Memory = 0, "" },
-		"tiny memory":            func(r *CreateRequest) { r.Memory = "1Mi" },
-		"bad kind":               func(r *CreateRequest) { r.CPUs, r.Memory, r.Instancetype = 0, "", &Ref{Name: "x", Kind: "Pod"} },
-		"no image":               func(r *CreateRequest) { r.DiskURL = "" },
-		"small disk":             func(r *CreateRequest) { r.DiskSize = "100Mi" },
-		"private http":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://10.0.0.1/disk.img" },
-		"metadata http":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://169.254.169.254/latest" },
-		"service http":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio.storage.svc:9000/a.img" },
-		"single label":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio/a.img" },
-		"ftp":                    func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "ftp://example.com/a.img" },
-		"trailing dot localhost": func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://localhost./a.img" },
-		"trailing dot service":   func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio.storage.svc./a.img" },
-		"trailing dot local":     func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://host.local./a.img" },
-		"zero net http":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0.0.0.1/a.img" },
-		"cgnat http":             func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://100.64.0.1/a.img" },
-		"multicast http":         func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://224.0.0.1/a.img" },
-		"shorthand ipv4":         func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://127.1/a.img" },
-		"octal ipv4":             func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0177.0.0.1/a.img" },
-		"hex ipv4":               func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0x7f.1/a.img" },
-		"ipv6 loopback":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::1]/a.img" },
-		"ipv6 zone":              func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[fe80::1%25eth0]/a.img" },
-		"ipv4-mapped loopback":   func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:127.0.0.1]/a.img" },
-		"ipv4-mapped private":    func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:10.0.0.1]/a.img" },
-		"nat64 loopback":         func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b::7f00:1]/a.img" },
-		"nat64 private":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b:1::a00:1]/a.img" },
-		"6to4 loopback":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[2002:7f00:1::1]/a.img" },
-		"long name with dv":      func(r *CreateRequest) { r.Name = strings.Repeat("a", 59) },
-		"bad ssh key":            func(r *CreateRequest) { r.SSHKeys = []string{"hello"} },
-		"multiline key":          func(r *CreateRequest) { r.SSHKeys = []string{"ssh-ed25519 AAAA\nruncmd"} },
-		"huge user data":         func(r *CreateRequest) { r.UserData = strings.Repeat("x", 17<<10) },
-		"unknown source":         func(r *CreateRequest) { r.DiskSource = "nfs" },
+		"no size":                 func(r *CreateRequest) { r.CPUs, r.Memory = 0, "" },
+		"tiny memory":             func(r *CreateRequest) { r.Memory = "1Mi" },
+		"bad kind":                func(r *CreateRequest) { r.CPUs, r.Memory, r.Instancetype = 0, "", &Ref{Name: "x", Kind: "Pod"} },
+		"no image":                func(r *CreateRequest) { r.DiskURL = "" },
+		"empty docker registry":   func(r *CreateRequest) { r.DiskURL = "docker://" },
+		"spaces docker registry":  func(r *CreateRequest) { r.DiskURL = "docker://   " },
+		"cr in registry url":      func(r *CreateRequest) { r.DiskURL = "docker://quay.io/foo\r:latest" },
+		"empty docker container":  func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceContainerDisk, "docker://" },
+		"spaces docker container": func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceContainerDisk, "docker://   " },
+		"cr in containerdisk url": func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceContainerDisk, "quay.io/foo\r:latest" },
+		"small disk":              func(r *CreateRequest) { r.DiskSize = "100Mi" },
+		"private http":            func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://10.0.0.1/disk.img" },
+		"metadata http":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://169.254.169.254/latest" },
+		"service http":            func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio.storage.svc:9000/a.img" },
+		"single label":            func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio/a.img" },
+		"ftp":                     func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "ftp://example.com/a.img" },
+		"trailing dot localhost":  func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://localhost./a.img" },
+		"trailing dot service":    func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://minio.storage.svc./a.img" },
+		"trailing dot local":      func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://host.local./a.img" },
+		"zero net http":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0.0.0.1/a.img" },
+		"cgnat http":              func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://100.64.0.1/a.img" },
+		"multicast http":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://224.0.0.1/a.img" },
+		"shorthand ipv4":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://127.1/a.img" },
+		"octal ipv4":              func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0177.0.0.1/a.img" },
+		"hex ipv4":                func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://0x7f.1/a.img" },
+		"ipv6 loopback":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::1]/a.img" },
+		"ipv6 zone":               func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[fe80::1%25eth0]/a.img" },
+		"ipv4-mapped loopback":    func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:127.0.0.1]/a.img" },
+		"ipv4-mapped private":     func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[::ffff:10.0.0.1]/a.img" },
+		"nat64 loopback":          func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b::7f00:1]/a.img" },
+		"nat64 private":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[64:ff9b:1::a00:1]/a.img" },
+		"6to4 loopback":           func(r *CreateRequest) { r.DiskSource, r.DiskURL = SourceHTTP, "http://[2002:7f00:1::1]/a.img" },
+		"long name with dv":       func(r *CreateRequest) { r.Name = strings.Repeat("a", 59) },
+		"bad ssh key":             func(r *CreateRequest) { r.SSHKeys = []string{"hello"} },
+		"multiline key":           func(r *CreateRequest) { r.SSHKeys = []string{"ssh-ed25519 AAAA\nruncmd"} },
+		"user data over 2 KiB":    func(r *CreateRequest) { r.UserData = strings.Repeat("x", maxUserData+1) },
+		"ssh keys over 2 KiB": func(r *CreateRequest) {
+			key := "ssh-ed25519 " + strings.Repeat("A", 600)
+			r.SSHKeys = []string{key, key, key, key}
+		},
+		"unknown source": func(r *CreateRequest) { r.DiskSource = "nfs" },
 	}
 	for name, mutate := range cases {
 		r := valid()
@@ -86,10 +96,45 @@ func TestValidate(t *testing.T) {
 	if err := cd.Validate(); err != nil {
 		t.Fatalf("63-char containerdisk name rejected: %v", err)
 	}
+	if cd.DiskURL != "quay.io/containerdisks/fedora:latest" {
+		t.Fatalf("containerdisk docker:// prefix not stripped: %q", cd.DiskURL)
+	}
 	max := valid()
 	max.Name = strings.Repeat("a", 58)
 	if err := max.Validate(); err != nil {
 		t.Fatalf("58-char name rejected: %v", err)
+	}
+
+	// Inline cloud-init userData is accepted at exactly 2048 bytes and rejected at 2049.
+	udOK := valid()
+	udOK.UserData = strings.Repeat("x", maxUserData)
+	if err := udOK.Validate(); err != nil {
+		t.Fatalf("2048-byte user data rejected: %v", err)
+	}
+	udTooBig := valid()
+	udTooBig.UserData = strings.Repeat("x", maxUserData+1)
+	if err := udTooBig.Validate(); !IsValidation(err) {
+		t.Fatalf("2049-byte user data: want validation error, got %v", err)
+	}
+
+	// SSH-key-generated cloud-config obeys the same 2048-byte inline limit.
+	sshOK := valid()
+	const keyPrefix = "ssh-ed25519 "
+	overhead := len("#cloud-config\nssh_authorized_keys:\n  - \"\"\n")
+	sshOK.SSHKeys = []string{keyPrefix + strings.Repeat("A", maxUserData-overhead-len(keyPrefix))}
+	if got := len(sshOK.CloudConfig()); got != maxUserData {
+		t.Fatalf("expected generated cloud-config length %d, got %d", maxUserData, got)
+	}
+	if err := sshOK.Validate(); err != nil {
+		t.Fatalf("2048-byte SSH cloud-config rejected: %v", err)
+	}
+	sshTooBig := valid()
+	sshTooBig.SSHKeys = []string{sshOK.SSHKeys[0] + "A"}
+	if got := len(sshTooBig.CloudConfig()); got != maxUserData+1 {
+		t.Fatalf("expected generated cloud-config length %d, got %d", maxUserData+1, got)
+	}
+	if err := sshTooBig.Validate(); !IsValidation(err) {
+		t.Fatalf("2049-byte SSH cloud-config: want validation error, got %v", err)
 	}
 }
 

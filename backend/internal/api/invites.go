@@ -37,36 +37,48 @@ func CreateInvite(ctx context.Context, st *store.Store, publicURL string, inv st
 	return inv, strings.TrimRight(publicURL, "/") + "/invite/" + token, nil
 }
 
-// usableInvite loads the invite named in the URL, writing the error
-// response itself when it is unknown or no longer usable.
-func (s *Server) usableInvite(w http.ResponseWriter, r *http.Request) (store.Invite, bool) {
+// usableInvite reserves an invite-limiter attempt and loads the invite named
+// in the URL, writing the error response itself (and releasing the attempt)
+// when it is rate-limited, unknown or no longer usable. On success the caller
+// must invoke the returned release function with whether the request counted
+// as a failed attempt.
+func (s *Server) usableInvite(w http.ResponseWriter, r *http.Request) (store.Invite, func(failed bool), bool) {
 	ipKey := s.rateKey(r)
-	if !s.inviteLimiter.Allowed(ipKey) {
+	if !s.inviteLimiter.Acquire(ipKey) {
 		writeError(w, http.StatusTooManyRequests, "too many attempts, try again later")
-		return store.Invite{}, false
+		return store.Invite{}, nil, false
 	}
+	handedOff := false
+	failed := false
+	defer func() {
+		if !handedOff {
+			s.inviteLimiter.Release(ipKey, failed)
+		}
+	}()
 	inv, err := s.Store.InviteByTokenHash(r.Context(), auth.HashToken(chi.URLParam(r, "token")))
 	if errors.Is(err, store.ErrNotFound) {
-		s.inviteLimiter.Fail(ipKey)
+		failed = true
 		writeError(w, http.StatusNotFound, "invite not found")
-		return store.Invite{}, false
+		return store.Invite{}, nil, false
 	}
 	if err != nil {
 		internalError(w, r, err)
-		return store.Invite{}, false
+		return store.Invite{}, nil, false
 	}
 	if !inv.Usable(s.now()) {
 		writeError(w, http.StatusGone, "invite has expired, been revoked or already been used")
-		return store.Invite{}, false
+		return store.Invite{}, nil, false
 	}
-	return inv, true
+	handedOff = true
+	return inv, func(failed bool) { s.inviteLimiter.Release(ipKey, failed) }, true
 }
 
 func (s *Server) getInvite(w http.ResponseWriter, r *http.Request) {
-	inv, ok := s.usableInvite(w, r)
+	inv, release, ok := s.usableInvite(w, r)
 	if !ok {
 		return
 	}
+	defer release(false)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"email": inv.Email, "namespace": inv.Namespace, "role": inv.Role,
 		"makeAdmin": inv.MakeAdmin, "expiresAt": inv.ExpiresAt,
@@ -86,10 +98,11 @@ func (s *Server) inviteTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The invite is loaded first: the username-availability answer below
 	// must only be given to whoever holds a usable invite link.
-	inv, ok := s.usableInvite(w, r)
+	inv, release, ok := s.usableInvite(w, r)
 	if !ok {
 		return
 	}
+	defer release(false)
 	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
 	if req.Username != "" {
 		if !usernameRE.MatchString(req.Username) {
@@ -122,9 +135,31 @@ func (s *Server) inviteTOTP(w http.ResponseWriter, r *http.Request) {
 			internalError(w, r, err)
 			return
 		}
-		if err := s.Store.SetInvitePendingTOTP(r.Context(), inv.ID, sealed); err != nil {
+		set, err := s.Store.SetInvitePendingTOTP(r.Context(), inv.ID, sealed)
+		if err != nil {
 			internalError(w, r, err)
 			return
+		}
+		if !set {
+			// A concurrent setup wrote pending_totp first; return its secret
+			// so both callers see the same QR code.
+			inv, err = s.Store.InviteByTokenHash(r.Context(), auth.HashToken(chi.URLParam(r, "token")))
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "invite not found")
+				return
+			}
+			if err != nil {
+				internalError(w, r, err)
+				return
+			}
+			if inv.PendingTOTP == nil {
+				internalError(w, r, errors.New("pending TOTP secret missing after concurrent update"))
+				return
+			}
+			if secret, err = s.Sealer.Open(inv.PendingTOTP); err != nil {
+				internalError(w, r, err)
+				return
+			}
 		}
 	}
 	account := req.Username
@@ -144,10 +179,12 @@ func (s *Server) redeemInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "username must be 3-32 characters: a-z, 0-9, '.', '_' or '-'")
 		return
 	}
-	inv, ok := s.usableInvite(w, r)
+	inv, release, ok := s.usableInvite(w, r)
 	if !ok {
 		return
 	}
+	failed := false
+	defer func() { release(failed) }()
 	if inv.PendingTOTP == nil {
 		writeError(w, http.StatusBadRequest, "set up the authenticator first")
 		return
@@ -159,7 +196,7 @@ func (s *Server) redeemInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	step, ok := auth.VerifyTOTP(secret, strings.TrimSpace(req.Code), s.now())
 	if !ok {
-		s.inviteLimiter.Fail(s.rateKey(r))
+		failed = true
 		writeError(w, http.StatusBadRequest, "authenticator code is incorrect")
 		return
 	}
@@ -212,10 +249,11 @@ func (s *Server) redeemInvite(w http.ResponseWriter, r *http.Request) {
 // another namespace.
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
-	inv, ok := s.usableInvite(w, r)
+	inv, release, ok := s.usableInvite(w, r)
 	if !ok {
 		return
 	}
+	defer release(false)
 	err := s.Store.AcceptInvite(r.Context(), inv, u.ID, s.now())
 	if errors.Is(err, store.ErrInviteUnusable) {
 		writeError(w, http.StatusGone, "invite has expired, been revoked or already been used")

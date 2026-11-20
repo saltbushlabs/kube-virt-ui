@@ -81,6 +81,9 @@ func (s *Server) Handler() http.Handler {
 
 	r.Route("/api", func(r chi.Router) {
 		r.Use(requireCSRFHeader)
+		r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusNotFound, "not found")
+		})
 		r.Post("/login", s.login)
 		r.Post("/logout", s.logout)
 		r.Get("/invites/{token}", s.getInvite)
@@ -162,11 +165,16 @@ func spa(dir string) http.HandlerFunc {
 	fsys := os.DirFS(dir)
 	files := http.FileServerFS(fsys)
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeError(w, http.StatusNotFound, "not found")
 			return
 		}
-		name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		clean := path.Clean("/" + r.URL.Path)
+		if clean == "/api" || strings.HasPrefix(clean, "/api/") {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		name := strings.TrimPrefix(clean, "/")
 		if info, err := fs.Stat(fsys, name); err != nil || info.IsDir() {
 			http.ServeFileFS(w, r, fsys, "index.html")
 			return

@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -301,5 +302,196 @@ func TestLoginLockoutIsPerSource(t *testing.T) {
 	good := map[string]string{"username": "root", "password": "a long enough password", "code": e.code(secret)}
 	if st := login(owner, good); st != 200 {
 		t.Fatalf("owner locked out by another source: %d", st)
+	}
+}
+
+func TestInviteTOTPConcurrentConsistentSecret(t *testing.T) {
+	e := newEnv(t)
+	e.api.now = time.Now
+	ctx := context.Background()
+	_, link, err := CreateInvite(ctx, e.store, "https://ui.test",
+		store.Invite{Namespace: "team-a", Role: "viewer", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := link[strings.LastIndex(link, "/")+1:]
+
+	const workers = 12
+	start := make(chan struct{})
+	secrets := make([]string, workers)
+	statuses := make([]int, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/invites/"+token+"/totp", strings.NewReader(`{"username":"alice"}`))
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			req.Header.Set("X-Requested-With", "kvui")
+			resp, err := e.client().Do(req)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			defer resp.Body.Close()
+			statuses[idx] = resp.StatusCode
+			var res struct{ Secret string }
+			errs[idx] = json.NewDecoder(resp.Body).Decode(&res)
+			secrets[idx] = res.Secret
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := range workers {
+		if errs[i] != nil {
+			t.Fatalf("worker %d error: %v", i, errs[i])
+		}
+		if statuses[i] != http.StatusOK || secrets[i] == "" {
+			t.Fatalf("worker %d: status=%d secret=%q", i, statuses[i], secrets[i])
+		}
+		if secrets[i] != secrets[0] {
+			t.Fatalf("worker %d got different secret %q != %q", i, secrets[i], secrets[0])
+		}
+	}
+
+	// Redeeming with the returned secret succeeds.
+	code, err := auth.TOTPCode(secrets[0], time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := e.do(e.client(), "POST", "/api/invites/"+token+"/redeem",
+		map[string]string{"username": "alice", "password": "a long enough password", "code": code}, nil); st != http.StatusCreated {
+		t.Fatalf("redeem with concurrent TOTP secret: %d", st)
+	}
+}
+
+func TestInviteLimiterAcquireReleaseConcurrency(t *testing.T) {
+	e := newEnv(t)
+	e.api.now = time.Now
+	e.api.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
+	e.api.inviteLimiter = auth.NewFailureLimiter(5, time.Minute)
+
+	ctx := context.Background()
+	_, link, err := CreateInvite(ctx, e.store, "https://ui.test",
+		store.Invite{Namespace: "team-a", Role: "viewer", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := link[strings.LastIndex(link, "/")+1:]
+
+	doFrom := func(from, method, path string, body any) int {
+		t.Helper()
+		var r *bytes.Reader
+		if body == nil {
+			r = bytes.NewReader(nil)
+		} else {
+			b, _ := json.Marshal(body)
+			r = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, e.srv.URL+path, r)
+		req.Header.Set("X-Requested-With", "kvui")
+		req.Header.Set("X-Forwarded-For", from)
+		resp, err := e.client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Sequential valid calls release their slots and never lock themselves out.
+	for i := range 8 {
+		if st := doFrom("198.51.100.10", http.MethodGet, "/api/invites/"+token, nil); st != http.StatusOK {
+			t.Fatalf("getInvite %d: %d", i, st)
+		}
+		if st := doFrom("198.51.100.10", http.MethodPost, "/api/invites/"+token+"/totp", map[string]string{"username": "alice"}); st != http.StatusOK {
+			t.Fatalf("inviteTOTP %d: %d", i, st)
+		}
+	}
+
+	// In-flight attempts acquired on the invite limiter block new requests until released.
+	const inflightIP = "198.51.100.11"
+	const inflightKey = "ip:" + inflightIP
+	for range 5 {
+		if !e.api.inviteLimiter.Acquire(inflightKey) {
+			t.Fatal("Acquire failed unexpectedly")
+		}
+	}
+	if st := doFrom(inflightIP, http.MethodGet, "/api/invites/"+token, nil); st != http.StatusTooManyRequests {
+		t.Fatalf("while at inflight limit: got %d, want 429", st)
+	}
+	for range 5 {
+		e.api.inviteLimiter.Release(inflightKey, false)
+	}
+	if st := doFrom(inflightIP, http.MethodGet, "/api/invites/"+token, nil); st != http.StatusOK {
+		t.Fatalf("after releasing inflight slots: got %d, want 200", st)
+	}
+
+	// Concurrent burst of unknown-token probes cannot exceed the failure limit.
+	const burstIP = "198.51.100.12"
+	const burst = 15
+	start := make(chan struct{})
+	codes := make([]int, burst)
+	burstErrs := make([]error, burst)
+	var wg sync.WaitGroup
+	for i := range burst {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodGet, e.srv.URL+"/api/invites/nonexistent-token", nil)
+			if err != nil {
+				burstErrs[idx] = err
+				return
+			}
+			req.Header.Set("X-Requested-With", "kvui")
+			req.Header.Set("X-Forwarded-For", burstIP)
+			resp, err := e.client().Do(req)
+			if err != nil {
+				burstErrs[idx] = err
+				return
+			}
+			resp.Body.Close()
+			codes[idx] = resp.StatusCode
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	notFound, limited := 0, 0
+	for i, st := range codes {
+		if burstErrs[i] != nil {
+			t.Fatalf("burst worker %d error: %v", i, burstErrs[i])
+		}
+		switch st {
+		case http.StatusNotFound:
+			notFound++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("unexpected burst status: %d", st)
+		}
+	}
+	if notFound > 5 || limited == 0 {
+		t.Fatalf("burst bypassed limit: 404=%d 429=%d", notFound, limited)
+	}
+
+	// Wrong TOTP codes on redeemInvite record failures via Release and lock out.
+	const redeemIP = "198.51.100.13"
+	for i := range 5 {
+		st := doFrom(redeemIP, http.MethodPost, "/api/invites/"+token+"/redeem",
+			map[string]string{"username": "alice", "password": "a long enough password", "code": "000000"})
+		if st != http.StatusBadRequest {
+			t.Fatalf("bad totp attempt %d: got %d, want 400", i, st)
+		}
+	}
+	if st := doFrom(redeemIP, http.MethodPost, "/api/invites/"+token+"/redeem",
+		map[string]string{"username": "alice", "password": "a long enough password", "code": "000000"}); st != http.StatusTooManyRequests {
+		t.Fatalf("redeem not locked out after 5 bad codes: got %d, want 429", st)
 	}
 }

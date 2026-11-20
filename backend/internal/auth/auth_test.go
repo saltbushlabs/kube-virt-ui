@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base32"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +233,80 @@ func TestFailureLimiterResetAndCleanup(t *testing.T) {
 	l.Reset("k")
 	if len(l.entries) != 0 {
 		t.Fatalf("Reset with nothing in flight left entries: %v", l.entries)
+	}
+}
+
+func TestFailureLimiterBoundedAndSweep(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l := NewFailureLimiter(2, 15*time.Minute)
+	l.now = func() time.Time { return now }
+	l.maxEntries = 5
+	l.sweepInterval = time.Minute
+
+	// Inserting more distinct keys than maxEntries stays capped at maxEntries,
+	// evicting the oldest entries first.
+	for i := range 12 {
+		now = now.Add(time.Second)
+		l.Fail(fmt.Sprintf("k%d", i))
+	}
+	if len(l.entries) != 5 || l.order.Len() != 5 {
+		t.Fatalf("entries=%d order=%d, want 5", len(l.entries), l.order.Len())
+	}
+	for i := range 7 {
+		if _, ok := l.entries[fmt.Sprintf("k%d", i)]; ok {
+			t.Fatalf("oldest key k%d was not evicted", i)
+		}
+	}
+	for i := 7; i < 12; i++ {
+		if _, ok := l.entries[fmt.Sprintf("k%d", i)]; !ok {
+			t.Fatalf("recent key k%d was unexpectedly evicted", i)
+		}
+	}
+
+	// Sweeps are throttled to sweepInterval rather than running on every failure.
+	firstSweep := l.lastSweep
+	now = firstSweep.Add(30 * time.Second)
+	l.Fail("within-interval")
+	if !l.lastSweep.Equal(firstSweep) {
+		t.Fatalf("sweep ran before sweepInterval: lastSweep=%v, firstSweep=%v", l.lastSweep, firstSweep)
+	}
+
+	// Once past window and sweepInterval, expired entries are swept cleanly.
+	now = now.Add(20 * time.Minute)
+	l.Fail("fresh")
+	if !l.lastSweep.Equal(now) {
+		t.Fatalf("sweep did not run after sweepInterval: lastSweep=%v, now=%v", l.lastSweep, now)
+	}
+	if len(l.entries) != 1 || l.order.Len() != 1 {
+		t.Fatalf("expired entries not swept: entries=%d order=%d", len(l.entries), l.order.Len())
+	}
+	if _, ok := l.entries["fresh"]; !ok {
+		t.Fatal("fresh entry missing after sweep")
+	}
+
+	// In-flight entries are not evicted to make room for new keys, and Acquire
+	// fails closed if every slot in the cap is actively in flight.
+	l2 := NewFailureLimiter(2, 15*time.Minute)
+	l2.now = func() time.Time { return now }
+	l2.maxEntries = 2
+	if !l2.Acquire("inflight-1") {
+		t.Fatal("inflight-1 acquire failed")
+	}
+	l2.Fail("evictable")
+	l2.Fail("newer")
+	if _, ok := l2.entries["inflight-1"]; !ok {
+		t.Fatal("in-flight entry was evicted")
+	}
+	if _, ok := l2.entries["evictable"]; ok {
+		t.Fatal("evictable entry was not evicted")
+	}
+	if !l2.Acquire("inflight-2") {
+		t.Fatal("inflight-2 acquire failed")
+	}
+	if l2.Acquire("overflow") {
+		t.Fatal("Acquire succeeded despite all maxEntries slots being in flight")
+	}
+	if len(l2.entries) != 2 {
+		t.Fatalf("cap exceeded: len=%d", len(l2.entries))
 	}
 }

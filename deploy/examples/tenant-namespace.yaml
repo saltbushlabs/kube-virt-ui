@@ -118,3 +118,46 @@ spec:
         - 169.254.0.0/16  # link-local, cloud metadata
         - 127.0.0.0/8
         - 0.0.0.0/8
+---
+# VMs attach to the default pod network with masquerade, so without an egress
+# policy any user with console or SSH access to a VM can reach cloud metadata
+# (169.254.169.254) and cluster-internal services. Allow DNS, same-namespace
+# pod traffic (so VMs in this tenant can reach each other) and public internet
+# only. The except list covers RFC 1918, CGNAT, link-local/metadata, loopback
+# and 0.0.0.0/8; if your pod or service CIDRs fall outside these, add them. No
+# IPv6 rule is given, so IPv6 egress is denied. Enforcement on masquerade-mode
+# VM traffic depends on the CNI (e.g. Cilium or Calico).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vm-egress
+  namespace: team-a
+spec:
+  podSelector:
+    matchLabels:
+      kubevirt.io: virt-launcher
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+  - to:
+    - podSelector: {}
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 100.64.0.0/10   # CGNAT
+        - 169.254.0.0/16  # link-local, cloud metadata
+        - 127.0.0.0/8
+        - 0.0.0.0/8

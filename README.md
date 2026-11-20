@@ -116,9 +116,10 @@ Dockerfile  builds both into one distroless image (published by .github/workflow
   one large request; see the ingress-nginx annotations in `values.yaml`.
   With `ingress.enabled`, set `trustedProxies` to the ingress controller's
   pod CIDR so login rate limits and the audit log see real client addresses.
-- **A CNI that enforces NetworkPolicy** (e.g. Cilium). Talos' default Flannel
-  does not, so the policies in `deploy/examples/tenant-namespace.yaml` would be
-  silently ignored. The importer egress policy is a security requirement; see
+- **A CNI that enforces NetworkPolicy** (e.g. Cilium or Calico). Talos' default
+  Flannel does not, so the policies in `deploy/examples/tenant-namespace.yaml`
+  would be silently ignored. The egress policies (`importer-egress` and
+  `vm-egress`) are a security requirement; see
   [Tenant namespaces](#tenant-namespaces).
 
 ## Install
@@ -158,6 +159,22 @@ private, cluster or cloud metadata (`169.254.169.254`) address. Only the
 egress policy, enforced by the CNI, stops that. If your pod or service CIDRs
 are outside the private ranges it already excludes, add them to its `except`
 list.
+
+**The `vm-egress` NetworkPolicy is recommended** (and critical on cloud
+clusters) in every tenant namespace. VMs attach to the default pod network in
+masquerade mode, so without an egress policy on `virt-launcher` pods, any user
+with console or SSH access to a VM can reach cloud metadata
+(`169.254.169.254`) and cluster-internal services. The example policy allows
+DNS, same-namespace pod traffic (it does not isolate VMs from other pods in
+the same tenant namespace) and public IPv4 internet only, excluding private,
+CGNAT, link-local/metadata, loopback and `0.0.0.0/8` ranges (add any custom
+pod or service CIDRs to its `except` list; IPv6 egress is denied by omission).
+Both `importer-egress` and `vm-egress` also allow port 53 to `169.254.20.10/32`
+for clusters running NodeLocal DNSCache (adjust that IP if your cluster uses a
+different local-DNS address, or remove it if unused). Whether launcher-pod
+egress is enforced depends on the CNI applying NetworkPolicy to
+masquerade-mode pod traffic (e.g. Cilium or Calico); verify enforcement on
+your cluster.
 
 ## Develop
 

@@ -1,8 +1,9 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Alert,
   AlertActionCloseButton,
+  Bullseye,
   Button,
   EmptyState,
   EmptyStateBody,
@@ -20,6 +21,7 @@ import {
   ModalHeader,
   PageSection,
   Progress,
+  Spinner,
   TextInput,
   Title,
 } from '@patternfly/react-core'
@@ -64,6 +66,12 @@ function UploadModal({ ns, onClose }: { ns: string; onClose: () => void }) {
   // already taken before this modal opened keeps erroring.
   const [attempted, setAttempted] = useState('')
   const busy = stage !== null
+  const abortRef = useRef<AbortController | null>(null)
+
+  // Abort any in-flight upload if the modal unmounts (e.g. SPA navigation).
+  useEffect(() => {
+    return () => abortRef.current?.abort()
+  }, [])
 
   // Leaving the page aborts the upload, so ask first.
   useEffect(() => {
@@ -77,19 +85,27 @@ function UploadModal({ ns, onClose }: { ns: string; onClose: () => void }) {
     e.preventDefault()
     if (!file) return
     setError('')
+    abortRef.current?.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
     const resume = attempted === meta.name
     // 'waiting' is only reached after the create call succeeded (or was
     // resumed), so only then is the name ours to resume on a retry.
     const onStage = (s: UploadStage) => {
+      if (ac.signal.aborted) return
       if (s.stage === 'waiting') setAttempted(meta.name)
       setStage(s)
     }
     try {
-      await uploadImage(ns, file, { ...meta, storageClass: meta.storageClass || undefined }, onStage, resume)
-      onClose()
+      await uploadImage(ns, file, { ...meta, storageClass: meta.storageClass || undefined }, onStage, resume, ac.signal)
+      if (!ac.signal.aborted) onClose()
     } catch (err) {
-      setError((err as Error).message)
-      setStage(null)
+      if (!ac.signal.aborted) {
+        setError((err as Error).message)
+        setStage(null)
+      }
+    } finally {
+      if (abortRef.current === ac) abortRef.current = null
     }
   }
 
@@ -173,22 +189,37 @@ export function ImagesPage() {
   const isOwner = me?.memberships.find((m) => m.namespace === ns)?.role === 'owner'
   const images = useApi<Image[]>(vmPath(ns) + '/images')
   const [uploading, setUploading] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
   const { reload } = images
 
-  // Poll while CDI is still processing something.
+  const [prevNs, setPrevNs] = useState(ns)
+  if (prevNs !== ns) {
+    setPrevNs(ns)
+    setUploading(false)
+    setDeleteTarget(null)
+    setError('')
+  }
+
+  // Poll while CDI is still processing something; pause while an error is
+  // shown so persistent 401/403 responses don't keep polling every 10s.
   const pending = images.data?.some((i) => i.phase !== 'Succeeded' && !i.problem)
   useEffect(() => {
+    if (images.error) return
     const t = setInterval(reload, pending ? 2000 : 10000)
     return () => clearInterval(t)
-  }, [reload, pending])
+  }, [reload, pending, images.error])
 
   async function remove(name: string) {
-    if (!confirm(`Delete image ${name}? VMs created from it keep their own copy; VMs using it as a CD-ROM keep it until they are deleted.`)) return
+    setDeleting(true)
     try {
       await api('DELETE', `${vmPath(ns)}/images/${encodeURIComponent(name)}`)
     } catch (e) {
       setError((e as Error).message)
+    } finally {
+      setDeleting(false)
+      setDeleteTarget(null)
     }
     reload()
   }
@@ -222,7 +253,13 @@ export function ImagesPage() {
             }
           />
         )}
-        {images.data?.length === 0 ? (
+        {images.data === null ? (
+          !images.error && (
+            <Bullseye>
+              <Spinner />
+            </Bullseye>
+          )
+        ) : images.data.length === 0 ? (
           <EmptyState titleText="No images" headingLevel="h2">
             <EmptyStateBody>Upload an ISO to install an operating system, or a disk image to clone into new VMs.</EmptyStateBody>
             {upload}
@@ -240,7 +277,7 @@ export function ImagesPage() {
               </Tr>
             </Thead>
             <Tbody>
-              {(images.data ?? []).map((img) => (
+              {images.data.map((img) => (
                 <Tr key={img.name}>
                   <Td dataLabel="Name">{img.name}</Td>
                   <Td dataLabel="Type">{img.type === 'iso' ? 'ISO' : 'Disk image'}</Td>
@@ -251,7 +288,7 @@ export function ImagesPage() {
                   <Td dataLabel="Uploaded">{new Date(img.created).toLocaleString()}</Td>
                   <Td isActionCell>
                     {isOwner && (
-                      <Button variant="link" isDanger onClick={() => remove(img.name)}>
+                      <Button variant="link" isDanger onClick={() => setDeleteTarget(img.name)}>
                         Delete
                       </Button>
                     )}
@@ -271,6 +308,20 @@ export function ImagesPage() {
           }}
         />
       )}
+      <Modal variant="small" isOpen={deleteTarget !== null} onClose={deleting ? undefined : () => setDeleteTarget(null)}>
+        <ModalHeader title={`Delete image ${deleteTarget ?? ''}?`} titleIconVariant="danger" />
+        <ModalBody>
+          VMs created from it keep their own copy; VMs using it as a CD-ROM keep it until they are deleted.
+        </ModalBody>
+        <ModalFooter>
+          <Button variant="danger" isLoading={deleting} isDisabled={deleting} onClick={() => deleteTarget && remove(deleteTarget)}>
+            Delete
+          </Button>
+          <Button variant="link" isDisabled={deleting} onClick={() => setDeleteTarget(null)}>
+            Cancel
+          </Button>
+        </ModalFooter>
+      </Modal>
     </>
   )
 }

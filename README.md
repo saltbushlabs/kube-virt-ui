@@ -97,6 +97,12 @@ Dockerfile  builds both into one distroless image (published by .github/workflow
 ## Cluster prerequisites
 
 - **KubeVirt and CDI** installed; nodes with VT-x/AMD-V (`/dev/kvm`).
+- **KubeVirt's default `instancetype.kubevirt.io:view` ClusterRoleBinding**
+  (bound to `system:authenticated`). Stock KubeVirt installations create this
+  binding automatically, allowing tenant ServiceAccounts to list cluster-scoped
+  instance types and preferences. If it has been removed or restricted,
+  cluster-scoped instance types and preferences will not appear in the
+  create-VM form (namespaced ones still work, and the backend logs a warning).
 - **A CSI storage class.** RWX block storage (e.g. Rook-Ceph RBD) is needed
   for live migration.
 - **A CDI StorageProfile for every storage class users may pick.** CDI fills
@@ -116,9 +122,10 @@ Dockerfile  builds both into one distroless image (published by .github/workflow
   one large request; see the ingress-nginx annotations in `values.yaml`.
   With `ingress.enabled`, set `trustedProxies` to the ingress controller's
   pod CIDR so login rate limits and the audit log see real client addresses.
-- **A CNI that enforces NetworkPolicy** (e.g. Cilium). Talos' default Flannel
-  does not, so the policies in `deploy/examples/tenant-namespace.yaml` would be
-  silently ignored. The importer egress policy is a security requirement; see
+- **A CNI that enforces NetworkPolicy** (e.g. Cilium or Calico). Talos' default
+  Flannel does not, so the policies in `deploy/examples/tenant-namespace.yaml`
+  would be silently ignored. The egress policies (`importer-egress` and
+  `vm-egress`) are a security requirement; see
   [Tenant namespaces](#tenant-namespaces).
 
 ## Install
@@ -143,6 +150,44 @@ Open the printed link to create the first administrator. Back up the generated
 `<release>-key` Secret: it encrypts the TOTP secrets, and losing it locks
 every user out of two-factor login.
 
+### GitOps (ArgoCD, Flux) and `helm template`
+
+**`existingSecret` is required when deploying via GitOps (`ArgoCD`, `Flux`) or
+`helm template`.**
+
+When `existingSecret` is empty, the chart's `Secret` template uses Helm's
+`lookup` function to preserve the generated `secret-key` across upgrades.
+Under `helm template` (used by ArgoCD, Flux template pipelines, and CI render
+workflows), `lookup` always returns empty, so every render or sync generates a
+new `secret-key` and overwrites the Secret (`helm.sh/resource-policy: keep`
+only prevents deletion on `helm uninstall`, not overwrites on `kubectl apply`
+or GitOps sync). Rotating or overwriting `secret-key` makes all stored TOTP
+secrets undecryptable and permanently locks every user out of two-factor login.
+
+Pre-create the Secret out-of-band (or manage it with External Secrets / Sealed
+Secrets) with a base64-encoded 32-byte key in `secret-key`, then pass its name
+via `existingSecret`:
+
+```sh
+kubectl create namespace kubevirt-ui
+kubectl -n kubevirt-ui create secret generic kvui-secret \
+  --from-literal=secret-key="$(openssl rand -base64 32)"
+
+helm template kvui deploy/helm/kubevirt-ui -n kubevirt-ui \
+  --set publicURL=https://vms.example.com \
+  --set existingSecret=kvui-secret
+```
+
+If you are migrating an existing `helm install` release to GitOps, copy
+`secret-key` from the chart-generated `<release>-key` Secret into a separately
+named Secret (such as `kvui-secret`) rather than pointing `existingSecret` at
+`<release>-key`. Once `existingSecret` is set, the chart stops rendering
+`<release>-key`; ArgoCD with auto-prune does not treat
+`helm.sh/resource-policy: keep` as a prune guard and could delete the
+now-untracked Secret (the chart also sets
+`argocd.argoproj.io/sync-options: Prune=false,Delete=false` on `<release>-key`
+as defence in depth).
+
 ## Tenant namespaces
 
 The chart does not know your tenant namespaces, so it cannot create their
@@ -158,6 +203,22 @@ private, cluster or cloud metadata (`169.254.169.254`) address. Only the
 egress policy, enforced by the CNI, stops that. If your pod or service CIDRs
 are outside the private ranges it already excludes, add them to its `except`
 list.
+
+**The `vm-egress` NetworkPolicy is recommended** (and critical on cloud
+clusters) in every tenant namespace. VMs attach to the default pod network in
+masquerade mode, so without an egress policy on `virt-launcher` pods, any user
+with console or SSH access to a VM can reach cloud metadata
+(`169.254.169.254`) and cluster-internal services. The example policy allows
+DNS, same-namespace pod traffic (it does not isolate VMs from other pods in
+the same tenant namespace) and public IPv4 internet only, excluding private,
+CGNAT, link-local/metadata, loopback and `0.0.0.0/8` ranges (add any custom
+pod or service CIDRs to its `except` list; IPv6 egress is denied by omission).
+Both `importer-egress` and `vm-egress` also allow port 53 to `169.254.20.10/32`
+for clusters running NodeLocal DNSCache (adjust that IP if your cluster uses a
+different local-DNS address, or remove it if unused). Whether launcher-pod
+egress is enforced depends on the CNI applying NetworkPolicy to
+masquerade-mode pod traffic (e.g. Cilium or Calico); verify enforcement on
+your cluster.
 
 ## Develop
 

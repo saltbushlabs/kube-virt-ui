@@ -1,6 +1,8 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import {
+  Alert,
+  AlertActionCloseButton,
   Button,
   Masthead,
   MastheadBrand,
@@ -12,6 +14,7 @@ import {
   NavItem,
   NavList,
   Page,
+  PageSection,
   PageSidebar,
   PageSidebarBody,
   Toolbar,
@@ -24,6 +27,22 @@ export function Layout({ children }: { children: ReactNode }) {
   const { me, logout } = useSession()
   const location = useLocation()
   const navigate = useNavigate()
+  const [logoutError, setLogoutError] = useState('')
+  const [loggingOut, setLoggingOut] = useState(false)
+
+  async function handleLogout() {
+    setLoggingOut(true)
+    setLogoutError('')
+    try {
+      await logout()
+      navigate('/login')
+    } catch (e) {
+      const msg = e instanceof Error && e.message ? e.message : 'Unexpected error'
+      setLogoutError(`Log out failed: ${msg}`)
+    } finally {
+      setLoggingOut(false)
+    }
+  }
 
   const item = (to: string, label: string, prefix = false) => (
     <NavItem key={to} isActive={prefix ? location.pathname === to || location.pathname.startsWith(to + '/') : location.pathname === to}>
@@ -45,13 +64,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <ToolbarContent>
             <ToolbarItem align={{ default: 'alignEnd' }}>{me?.user.username}</ToolbarItem>
             <ToolbarItem>
-              <Button
-                variant="secondary"
-                onClick={async () => {
-                  await logout()
-                  navigate('/login')
-                }}
-              >
+              <Button variant="secondary" isLoading={loggingOut} isDisabled={loggingOut} onClick={handleLogout}>
                 Log out
               </Button>
             </ToolbarItem>
@@ -85,6 +98,16 @@ export function Layout({ children }: { children: ReactNode }) {
 
   return (
     <Page masthead={masthead} sidebar={sidebar}>
+      {logoutError && (
+        <PageSection>
+          <Alert
+            variant="danger"
+            isInline
+            title={logoutError}
+            actionClose={<AlertActionCloseButton onClose={() => setLogoutError('')} />}
+          />
+        </PageSection>
+      )}
       {children}
     </Page>
   )

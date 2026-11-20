@@ -13,3 +13,26 @@ WARNING: every tenant namespace needs the importer-egress NetworkPolicy from
 that example, and a CNI that enforces it. Without it, users who import disks
 by URL can make CDI's importer fetch cluster-internal services or cloud
 metadata endpoints (SSRF).
+{{- if not .Values.existingSecret }}
+
+WARNING: existingSecret is not set, so the chart generated the Secret
+"{{ include "kvui.secretName" . }}" in namespace "{{ .Release.Namespace }}".
+Back up this Secret now: losing or overwriting its `secret-key` makes all
+stored TOTP secrets undecryptable and permanently locks users out of login.
+
+IMPORTANT for GitOps (ArgoCD, Flux) and `helm template`:
+`existingSecret` is REQUIRED when deploying via GitOps or `helm template`.
+Helm's `lookup` function always returns empty during template rendering, so
+every render/sync would rotate `secret-key` and overwrite the Secret.
+
+Before switching an existing release to GitOps or `helm template`, copy
+`secret-key` from "{{ include "kvui.secretName" . }}" into a separately named
+Secret managed out-of-band (for example `kvui-secret`) and point
+`existingSecret` at that new Secret rather than reusing
+"{{ include "kvui.secretName" . }}". Once `existingSecret` is set, the chart
+stops rendering "{{ include "kvui.secretName" . }}", and GitOps controllers
+with auto-prune (such as ArgoCD) do not treat `helm.sh/resource-policy: keep`
+as a prune guard:
+
+  --set existingSecret=kvui-secret
+{{- end }}

@@ -34,6 +34,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       .then((user) => {
         if (!cancelled) setMe(user)
       })
+      .catch(() => {})
       .finally(() => {
         if (!cancelled) setLoading(false)
       })

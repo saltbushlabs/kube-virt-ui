@@ -1,6 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api'
 
+async function loadPath<T>(
+  path: string,
+  abortRef: { current: AbortController | null },
+  onData: (result: T) => void,
+  onError: (msg: string) => void,
+) {
+  abortRef.current?.abort()
+  const ac = new AbortController()
+  abortRef.current = ac
+  try {
+    const result = await api<T>('GET', path, undefined, ac.signal)
+    if (!ac.signal.aborted) {
+      onData(result)
+      onError('')
+    }
+  } catch (e) {
+    if (!ac.signal.aborted) onError((e as Error).message)
+  }
+}
+
 // useApi GETs path and exposes the result with a reload function. When the
 // path changes the previous result is cleared and any in-flight request is
 // aborted, so one namespace's data is never shown under another's title and
@@ -19,38 +39,16 @@ export function useApi<T>(path: string) {
     setError('')
   }
 
+  const abort = useCallback(() => abortRef.current?.abort(), [])
+
   const reload = useCallback(async () => {
-    abortRef.current?.abort()
-    const ac = new AbortController()
-    abortRef.current = ac
-    try {
-      const result = await api<T>('GET', path, undefined, ac.signal)
-      if (!ac.signal.aborted) {
-        setData(result)
-        setError('')
-      }
-    } catch (e) {
-      if (!ac.signal.aborted) setError((e as Error).message)
-    }
+    await loadPath(path, abortRef, setData, setError)
   }, [path])
 
   useEffect(() => {
-    abortRef.current?.abort()
-    const ac = new AbortController()
-    abortRef.current = ac
-    api<T>('GET', path, undefined, ac.signal).then(
-      (result) => {
-        if (!ac.signal.aborted) {
-          setData(result)
-          setError('')
-        }
-      },
-      (e) => {
-        if (!ac.signal.aborted) setError((e as Error).message)
-      },
-    )
-    return () => abortRef.current?.abort()
-  }, [path])
+    void loadPath(path, abortRef, setData, setError)
+    return abort
+  }, [path, abort])
 
   const clearError = useCallback(() => setError(''), [])
 

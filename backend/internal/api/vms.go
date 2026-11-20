@@ -233,7 +233,7 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-cache, no-store")
 	h.Set("X-Accel-Buffering", "no") // disable nginx ingress buffering
 	fmt.Fprint(w, "retry: 2000\n\n")
 

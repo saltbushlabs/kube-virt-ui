@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -220,13 +221,16 @@ func (p *UploadProxy) client(ctx context.Context) (*http.Client, error) {
 		}
 		serverName = u.Hostname()
 	}
-	return &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: serverName, MinVersion: tls.VersionTLS12},
-		Proxy:           http.ProxyFromEnvironment,
-		// With Expect: 100-continue the body is only sent once the proxy
-		// has reached the upload server; see Upload.
-		ExpectContinueTimeout: 30 * time.Second,
-	}}, nil
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep HTTP/1.1 to cdi-uploadproxy so Expect: 100-continue and the
+	// retry-on-502/503 loop preserve the existing upload behavior.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: serverName, MinVersion: tls.VersionTLS12}
+	transport.Proxy = http.ProxyFromEnvironment
+	// With Expect: 100-continue the body is only sent once the proxy
+	// has reached the upload server; see Upload.
+	transport.ExpectContinueTimeout = 30 * time.Second
+	return &http.Client{Transport: transport}, nil
 }
 
 // Upload streams body into image name. The upload token is requested with
@@ -268,7 +272,7 @@ func (p *UploadProxy) Upload(ctx context.Context, dyn dynamic.Interface, namespa
 	for attempt := 1; ; attempt++ {
 		err := p.send(ctx, client, token, counted, length)
 		var rejected *UploadError
-		if !errors.As(err, &rejected) || counted.n > 0 || attempt == uploadAttempts ||
+		if !errors.As(err, &rejected) || counted.n.Load() > 0 || attempt == uploadAttempts ||
 			(rejected.Status != http.StatusBadGateway && rejected.Status != http.StatusServiceUnavailable) {
 			return err
 		}
@@ -307,12 +311,12 @@ func (p *UploadProxy) send(ctx context.Context, client *http.Client, token strin
 
 type countingReader struct {
 	r io.Reader
-	n int64
+	n atomic.Int64
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
 

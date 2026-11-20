@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,18 +23,38 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
+// requestScheme returns "https" when r arrived over TLS or via a trusted
+// proxy that forwarded X-Forwarded-Proto: https, and "http" otherwise.
+func (s *Server) requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if peer, err := netip.ParseAddrPort(r.RemoteAddr); err == nil && s.trustedProxy(peer.Addr().Unmap()) {
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			if i := strings.IndexByte(proto, ','); i >= 0 {
+				proto = proto[:i]
+			}
+			if strings.EqualFold(strings.TrimSpace(proto), "https") {
+				return "https"
+			}
+		}
+	}
+	return "http"
+}
+
 // sameOrigin rejects cross-site websocket handshakes. Websockets are GETs, so
 // the X-Requested-With CSRF check does not cover them.
 func (s *Server) sameOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	if err != nil || origin.Host == "" {
+	if err != nil || origin.Host == "" || origin.Scheme == "" {
 		return false
 	}
-	if origin.Host == r.Host {
-		return true
+	if public, err := url.Parse(s.PublicURL); err == nil && public.Host != "" && public.Scheme != "" {
+		if strings.EqualFold(origin.Host, public.Host) {
+			return strings.EqualFold(origin.Scheme, public.Scheme)
+		}
 	}
-	public, err := url.Parse(s.PublicURL)
-	return err == nil && origin.Host == public.Host
+	return strings.EqualFold(origin.Host, r.Host) && strings.EqualFold(origin.Scheme, s.requestScheme(r))
 }
 
 // console proxies the browser's websocket to KubeVirt's VNC or serial

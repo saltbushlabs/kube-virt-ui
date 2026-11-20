@@ -99,6 +99,8 @@ CREATE TABLE audit (
 	target    TEXT NOT NULL DEFAULT '',
 	ip        TEXT NOT NULL DEFAULT ''
 );
+`, `
+CREATE INDEX audit_at ON audit(at);
 `}
 
 func (s *Store) migrate() error {

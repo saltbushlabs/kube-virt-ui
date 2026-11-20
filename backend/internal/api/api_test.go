@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -301,5 +302,147 @@ func TestLoginLockoutIsPerSource(t *testing.T) {
 	good := map[string]string{"username": "root", "password": "a long enough password", "code": e.code(secret)}
 	if st := login(owner, good); st != 200 {
 		t.Fatalf("owner locked out by another source: %d", st)
+	}
+}
+
+func TestTruncateUTF8AndAuditTargetCap(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"empty", "", 128, ""},
+		{"zero_max", "abc", 0, ""},
+		{"negative_max", "abc", -1, ""},
+		{"within_limit", "alice", 128, "alice"},
+		{"exact_limit", "abcd", 4, "abcd"},
+		{"ascii_truncated", "abcdef", 4, "abcd"},
+		{"two_byte_boundary", "a" + strings.Repeat("é", 4), 4, "aé"},
+		{"three_byte_boundary", "a€b", 3, "a"},
+		{"three_byte_exact", "a€b", 4, "a€"},
+		{"four_byte_boundary", "x🚀y", 4, "x"},
+		{"four_byte_exact", "x🚀y", 5, "x🚀"},
+		{"single_rune_exceeds_max", "🚀", 2, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateUTF8(tc.in, tc.max)
+			if got != tc.want {
+				t.Fatalf("truncateUTF8(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+			if tc.max > 0 && len(got) > tc.max {
+				t.Fatalf("len(%q) = %d > %d", got, len(got), tc.max)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("invalid UTF-8: %q", got)
+			}
+		})
+	}
+
+	e := newEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/login", nil)
+	req.RemoteAddr = "198.51.100.10:12345"
+	// 1 ASCII byte + 100 three-byte runes = 301 bytes; maxAuditTargetBytes (128)
+	// fits 1 + 42*3 = 127 bytes without splitting a rune.
+	longTarget := "a" + strings.Repeat("€", 100)
+	e.api.audit(req, nil, "login.failed", "", longTarget)
+
+	entries, err := e.store.ListAudit(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 audit entry, got %d", len(entries))
+	}
+	got := entries[0].Target
+	want := "a" + strings.Repeat("€", 42)
+	if got != want || len(got) > maxAuditTargetBytes || !utf8.ValidString(got) {
+		t.Fatalf("audit target = %q (len %d, valid=%v), want %q", got, len(got), utf8.ValidString(got), want)
+	}
+}
+
+func TestLoginOversizedUsername(t *testing.T) {
+	e := newEnv(t)
+	e.api.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
+
+	// Create a real user to verify an oversized username sharing its prefix
+	// neither matches the user nor interferes with legitimate login.
+	_, link, err := CreateInvite(context.Background(), e.store, "https://ui.test",
+		store.Invite{MakeAdmin: true, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := e.redeem(e.client(), link, "alice")
+
+	hugeUser := "alice" + strings.Repeat("x", 900*1024)
+	longPass := strings.Repeat("p", auth.MaxPasswordLen+1)
+
+	// Verify the limiter key itself is bounded well below the raw input.
+	key := loginUserKey(hugeUser, "ip:198.51.100.1")
+	wantKey := "user:" + hugeUser[:maxLoginUsernameBytes] + "|ip:198.51.100.1"
+	if key != wantKey {
+		t.Fatalf("loginUserKey len=%d, want %d", len(key), len(wantKey))
+	}
+
+	loginFrom := func(from string, body map[string]string) int {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest("POST", e.srv.URL+"/api/login", bytes.NewReader(b))
+		req.Header.Set("X-Requested-With", "kvui")
+		req.Header.Set("X-Forwarded-For", from)
+		resp, err := e.client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Even with alice's valid password and TOTP, an overlong username fails.
+	if st := loginFrom("198.51.100.2", map[string]string{
+		"username": hugeUser, "password": "a long enough password", "code": e.code(secret),
+	}); st != 401 {
+		t.Fatalf("overlong username with real password: %d", st)
+	}
+
+	// Repeated attempts with ~900 KiB username + >256-byte password hit 401
+	// until rate-limited at 429, and every audit row stays bounded.
+	bad := map[string]string{"username": hugeUser, "password": longPass, "code": "000000"}
+	for i := 0; i < 10; i++ {
+		if st := loginFrom("198.51.100.1", bad); st != 401 {
+			t.Fatalf("attempt %d: %d", i, st)
+		}
+	}
+	if st := loginFrom("198.51.100.1", bad); st != 429 {
+		t.Fatalf("expected 429 lockout, got %d", st)
+	}
+
+	entries, err := e.store.ListAudit(context.Background(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedCount := 0
+	for _, entry := range entries {
+		if entry.Action != "login.failed" {
+			continue
+		}
+		failedCount++
+		if len(entry.Target) != maxAuditTargetBytes {
+			t.Fatalf("audit target length = %d, want %d", len(entry.Target), maxAuditTargetBytes)
+		}
+		if entry.Target != hugeUser[:maxAuditTargetBytes] {
+			t.Fatalf("unexpected audit target prefix")
+		}
+	}
+	if failedCount != 11 {
+		t.Fatalf("expected 11 login.failed audit entries, got %d", failedCount)
+	}
+
+	// Real user from another IP can still log in cleanly.
+	if st := loginFrom("203.0.113.7", map[string]string{
+		"username": "alice", "password": "a long enough password", "code": e.code(secret),
+	}); st != 200 {
+		t.Fatalf("valid login failed: %d", st)
 	}
 }

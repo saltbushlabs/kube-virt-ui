@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,6 +18,8 @@ var (
 	instancetypes        = schema.GroupVersionResource{Group: "instancetype.kubevirt.io", Version: "v1beta1", Resource: "virtualmachineinstancetypes"}
 	clusterPreferences   = schema.GroupVersionResource{Group: "instancetype.kubevirt.io", Version: "v1beta1", Resource: "virtualmachineclusterpreferences"}
 	preferences          = schema.GroupVersionResource{Group: "instancetype.kubevirt.io", Version: "v1beta1", Resource: "virtualmachinepreferences"}
+
+	clusterForbiddenWarned sync.Map // resource name -> struct{}
 )
 
 // Instancetype is a selectable VM size.
@@ -87,8 +90,13 @@ func listBoth(ctx context.Context, dyn dynamic.Interface, namespace string, clus
 		list, err := s.res.List(ctx, metav1.ListOptions{})
 		if apierrors.IsForbidden(err) {
 			if s.clusterScope {
-				slog.Warn("cannot list cluster-scoped resource; check the instancetype.kubevirt.io:view ClusterRoleBinding",
-					"resource", s.resource, "namespace", namespace, "err", err)
+				if _, already := clusterForbiddenWarned.LoadOrStore(s.resource, struct{}{}); !already {
+					slog.Warn("cannot list cluster-scoped resource; check the instancetype.kubevirt.io:view ClusterRoleBinding",
+						"resource", s.resource, "namespace", namespace, "err", err)
+				} else {
+					slog.Debug("cannot list cluster-scoped resource; check the instancetype.kubevirt.io:view ClusterRoleBinding",
+						"resource", s.resource, "namespace", namespace, "err", err)
+				}
 			}
 			continue
 		}

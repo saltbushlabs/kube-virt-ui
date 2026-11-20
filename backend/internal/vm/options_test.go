@@ -26,10 +26,14 @@ var optionsListKinds = map[schema.GroupVersionResource]string{
 
 func captureLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
+	clusterForbiddenWarned.Clear()
 	var buf bytes.Buffer
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		clusterForbiddenWarned.Clear()
+	})
 	return &buf
 }
 
@@ -125,6 +129,19 @@ func TestListInstancetypesClusterForbiddenWarnsAndContinues(t *testing.T) {
 		if !strings.Contains(logs, sub) {
 			t.Errorf("warning log missing %q: %s", sub, logs)
 		}
+	}
+
+	// Subsequent 403s for the same cluster-scoped resource log at DEBUG instead of repeating WARN.
+	buf.Reset()
+	if _, err := ListInstancetypes(context.Background(), client, "team-a"); err != nil {
+		t.Fatalf("second ListInstancetypes: %v", err)
+	}
+	repeatLogs := buf.String()
+	if strings.Contains(repeatLogs, "level=WARN") {
+		t.Errorf("expected WARN only once per resource, got: %s", repeatLogs)
+	}
+	if !strings.Contains(repeatLogs, "level=DEBUG") || !strings.Contains(repeatLogs, clusterInstancetypes.Resource) {
+		t.Errorf("expected DEBUG log on repeat 403, got: %s", repeatLogs)
 	}
 }
 

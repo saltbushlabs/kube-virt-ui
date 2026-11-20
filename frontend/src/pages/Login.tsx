@@ -16,6 +16,7 @@ import {
   TextInput,
 } from '@patternfly/react-core'
 import { api } from '../api'
+import { safeNext } from '../safeNext'
 import { useSession } from '../session'
 
 export function AuthCard({ title, children }: { title: string; children: ReactNode }) {
@@ -27,25 +28,6 @@ export function AuthCard({ title, children }: { title: string; children: ReactNo
       </Card>
     </Bullseye>
   )
-}
-
-// Only same-origin paths are accepted as redirect targets. Browsers treat
-// '\' like '/' and strip tabs/newlines, so '/\evil.example' or '/\t/evil'
-// would otherwise become protocol-relative; reject those outright, then
-// resolve against our origin and keep only the path.
-export function safeNext(next: string | null): string {
-  if (!next || next[0] !== '/' || next[1] === '/' || next[1] === '\\') return '/'
-  for (const ch of next) {
-    const c = ch.charCodeAt(0)
-    if (c < 0x20 || c === 0x7f) return '/'
-  }
-  try {
-    const url = new URL(next, window.location.origin)
-    if (url.origin !== window.location.origin) return '/'
-    return url.pathname + url.search + url.hash
-  } catch {
-    return '/'
-  }
 }
 
 export function LoginPage() {

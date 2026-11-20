@@ -14,7 +14,7 @@ const GiB = 1024 ** 3
 // suggestImage derives a name, type and disk size from the chosen file.
 // Disk sizes leave room for filesystem overhead; qcow2 images may expand,
 // so they get at least 10 GiB.
-export function suggestImage(file: File): UploadMeta {
+export function suggestImage(file: Pick<File, 'name' | 'size'>): UploadMeta {
   const base = file.name.replace(/\.[^.]+$/, '').toLowerCase()
   const name = base.replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63) || 'image'
   const type = /\.iso$/i.test(file.name) ? 'iso' : 'disk'

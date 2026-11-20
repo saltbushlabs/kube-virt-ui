@@ -35,9 +35,22 @@ export function useApi<T>(path: string) {
   }, [path])
 
   useEffect(() => {
-    reload()
+    abortRef.current?.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
+    api<T>('GET', path, undefined, ac.signal).then(
+      (result) => {
+        if (!ac.signal.aborted) {
+          setData(result)
+          setError('')
+        }
+      },
+      (e) => {
+        if (!ac.signal.aborted) setError((e as Error).message)
+      },
+    )
     return () => abortRef.current?.abort()
-  }, [reload])
+  }, [path])
 
   const clearError = useCallback(() => setError(''), [])
 

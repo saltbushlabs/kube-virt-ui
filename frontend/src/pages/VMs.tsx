@@ -4,7 +4,9 @@ import { Alert, AlertActionCloseButton, Bullseye, Button, EmptyState, EmptyState
 import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table'
 import { useSession } from '../session'
 import { NamespaceTabs } from '../NamespaceTabs'
-import { PowerMenu, useVMWatch, vmSize, VMStatusCell } from '../vms'
+import { useVMWatch } from '../useVMWatch'
+import { vmSize } from '../vmHelpers'
+import { PowerMenu, VMStatusCell } from '../vms'
 
 export function VMsPage() {
   const { ns = '' } = useParams()

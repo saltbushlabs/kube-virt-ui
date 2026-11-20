@@ -22,7 +22,9 @@ import {
   Title,
 } from '@patternfly/react-core'
 import { useSession } from '../session'
-import { diskNote, PowerMenu, useVMWatch, vmSize, VMStatus } from '../vms'
+import { useVMWatch } from '../useVMWatch'
+import { diskNote, vmSize } from '../vmHelpers'
+import { PowerMenu, VMStatus } from '../vms'
 import { SerialConsole, VNCConsole } from '../consoles'
 
 export function VMPage() {

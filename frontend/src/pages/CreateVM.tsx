@@ -107,13 +107,15 @@ export function CreateVMPage() {
 
   async function submit(e: FormEvent) {
     e.preventDefault()
+    const trimmedDiskSize = diskSize.trim()
+    const trimmedMemory = memory.trim()
     // The size fields are text so they can be emptied while typing; make
     // sure they hold a positive number before building "Gi"/"Mi" strings.
-    if (persistent && !(Number(diskSize) > 0)) {
+    if (persistent && !(Number(trimmedDiskSize) > 0)) {
       setError('Enter a disk size')
       return
     }
-    if (sizeMode === 'custom' && !(Number(memory) > 0)) {
+    if (sizeMode === 'custom' && !(Number(trimmedMemory) > 0)) {
       setError('Enter a memory size')
       return
     }
@@ -123,7 +125,7 @@ export function CreateVMPage() {
       diskUrl: source.urlLabel ? diskUrl : undefined,
       image: diskSource === 'image' ? image : undefined,
       cdrom: cdrom || undefined,
-      diskSize: persistent ? `${diskSize}Gi` : undefined,
+      diskSize: persistent ? `${trimmedDiskSize}Gi` : undefined,
       storageClass: persistent && storageClass ? storageClass : undefined,
       sshKeys: sshKeys.split('\n').map((k) => k.trim()).filter(Boolean),
       userData: userData.trim() ? userData : undefined,
@@ -138,7 +140,7 @@ export function CreateVMPage() {
       req.instancetype = { name: it.name, kind: it.kind }
     } else {
       req.cpus = cpus
-      req.memory = `${memory}${memoryUnit}`
+      req.memory = `${trimmedMemory}${memoryUnit}`
     }
     const pref = opts?.preferences.find((p) => refKey(p) === preference)
     if (pref) req.preference = { name: pref.name, kind: pref.kind }
@@ -146,8 +148,8 @@ export function CreateVMPage() {
     setBusy(true)
     setError('')
     try {
-      await api('POST', vmPath(ns) + '/vms', req)
-      navigate(`/ns/${encodeURIComponent(ns)}/vms/${encodeURIComponent(name)}`)
+      const created = await api<{ name: string }>('POST', vmPath(ns) + '/vms', req)
+      navigate(`/ns/${encodeURIComponent(ns)}/vms/${encodeURIComponent(created.name)}`)
     } catch (err) {
       setError((err as Error).message)
       window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -180,7 +182,7 @@ export function CreateVMPage() {
       </PageSection>
       <PageSection>
         <Form onSubmit={submit} style={{ maxWidth: 760 }}>
-          {(error || options.error) && <Alert variant="danger" isInline title={error || options.error} />}
+          {(error || options.error || images.error) && <Alert variant="danger" isInline title={error || options.error || images.error} />}
 
           <FormGroup label="Name" isRequired fieldId="name">
             <TextInput id="name" value={name} onChange={(_, v) => setName(v.toLowerCase())} isRequired />
@@ -333,7 +335,7 @@ export function CreateVMPage() {
                   style={{ fontFamily: 'monospace' }}
                   placeholder={'#cloud-config\npackages:\n  - nginx'}
                 />
-                {help('Replaces the generated cloud-config, including the SSH keys above. Visible to everyone in the namespace: do not put secrets here.')}
+                {help('Replaces the generated cloud-config, including the SSH keys above. Limited to 2 KiB inline. Visible to everyone in the namespace: do not put secrets here.')}
               </ExpandableSection>
             </CardBody>
           </Card>

@@ -4,6 +4,7 @@ import type { Me } from './api'
 export interface Session {
   me: Me | null
   loading: boolean
+  error: string | null
   refresh: () => Promise<void>
   logout: () => Promise<void>
 }

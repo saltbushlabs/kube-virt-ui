@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react'
 import { vmPath, type VM } from './api'
+import { useSession } from './session'
 
 // useVMWatch subscribes to the namespace's live VM list over server-sent
 // events. EventSource reconnects by itself after the server's periodic
-// stream cut; a refused reconnect (e.g. membership removed) closes it.
+// stream cut; a refused reconnect (e.g. session expiry or membership
+// removed) closes it, clears stale VM data, and re-checks the session.
 export function useVMWatch(ns: string) {
+  const { refresh } = useSession()
   const [vms, setVms] = useState<VM[] | null>(null)
   const [error, setError] = useState('')
 
@@ -19,6 +22,7 @@ export function useVMWatch(ns: string) {
   }
 
   useEffect(() => {
+    let closed = false
     const es = new EventSource('/api' + vmPath(ns) + '/watch/vms')
     es.onmessage = (e) => {
       setVms(JSON.parse(e.data))
@@ -26,10 +30,16 @@ export function useVMWatch(ns: string) {
     }
     es.addEventListener('failure', (e) => setError(JSON.parse((e as MessageEvent).data)))
     es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) setError('Live updates stopped. Reload the page to retry.')
+      if (closed || es.readyState !== EventSource.CLOSED) return
+      setVms(null)
+      setError('Live updates stopped. Reload the page to retry.')
+      void refresh().catch(() => {})
     }
-    return () => es.close()
-  }, [ns])
+    return () => {
+      closed = true
+      es.close()
+    }
+  }, [ns, refresh])
 
   return { vms, error }
 }

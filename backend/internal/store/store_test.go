@@ -78,3 +78,29 @@ func TestTOTPReplayAndRecoveryCodes(t *testing.T) {
 		t.Fatal("recovery code reused")
 	}
 }
+
+func TestPurgeAudit(t *testing.T) {
+	ctx, s := context.Background(), open(t)
+	now := time.Unix(1_700_000_000, 0)
+	cutoff := now.Add(-90 * 24 * time.Hour)
+
+	for _, e := range []AuditEntry{
+		{At: cutoff.Add(-time.Second), Actor: "cli", Action: "old"},
+		{At: cutoff, Actor: "cli", Action: "boundary"},
+		{At: now, Actor: "cli", Action: "recent"},
+	} {
+		if err := s.Audit(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PurgeAudit(ctx, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Action != "recent" || entries[1].Action != "boundary" {
+		t.Fatalf("remaining audit entries: %+v", entries)
+	}
+}

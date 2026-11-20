@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from './api'
+import { api, ApiError } from './api'
 
 async function loadPath<T>(
   path: string,
   abortRef: { current: AbortController | null },
   onData: (result: T) => void,
   onError: (msg: string) => void,
+  onErrorStatus: (status: number | null) => void,
 ) {
   abortRef.current?.abort()
   const ac = new AbortController()
@@ -15,9 +16,13 @@ async function loadPath<T>(
     if (!ac.signal.aborted) {
       onData(result)
       onError('')
+      onErrorStatus(null)
     }
   } catch (e) {
-    if (!ac.signal.aborted) onError((e as Error).message)
+    if (!ac.signal.aborted) {
+      onError((e as Error).message)
+      onErrorStatus(e instanceof ApiError ? e.status : null)
+    }
   }
 }
 
@@ -28,6 +33,7 @@ async function loadPath<T>(
 export function useApi<T>(path: string) {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState('')
+  const [errorStatus, setErrorStatus] = useState<number | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   // Reset during render when the path changes (React's recommended
@@ -37,20 +43,24 @@ export function useApi<T>(path: string) {
     setPrevPath(path)
     setData(null)
     setError('')
+    setErrorStatus(null)
   }
 
   const abort = useCallback(() => abortRef.current?.abort(), [])
 
   const reload = useCallback(async () => {
-    await loadPath(path, abortRef, setData, setError)
+    await loadPath(path, abortRef, setData, setError, setErrorStatus)
   }, [path])
 
   useEffect(() => {
-    void loadPath(path, abortRef, setData, setError)
+    void loadPath(path, abortRef, setData, setError, setErrorStatus)
     return abort
   }, [path, abort])
 
-  const clearError = useCallback(() => setError(''), [])
+  const clearError = useCallback(() => {
+    setError('')
+    setErrorStatus(null)
+  }, [])
 
-  return { data, error, reload, clearError }
+  return { data, error, errorStatus, reload, clearError }
 }

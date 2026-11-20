@@ -53,9 +53,13 @@ describe('suggestImage', () => {
     })
   })
 
-  it('truncates long names to the 63-character Kubernetes label limit', () => {
+  it('truncates long names to the 63-character Kubernetes label limit without trailing hyphens', () => {
     const res = suggestImage({ name: `${'a'.repeat(80)}.qcow2`, size: 1 * GiB })
     expect(res.name).toBe('a'.repeat(63))
     expect(res.name.length).toBe(63)
+
+    const hyphenAt63 = suggestImage({ name: `${'a'.repeat(62)}-${'b'.repeat(10)}.qcow2`, size: 1 * GiB })
+    expect(hyphenAt63.name).toBe('a'.repeat(62))
+    expect(hyphenAt63.name.endsWith('-')).toBe(false)
   })
 })

@@ -259,8 +259,29 @@ func (s *Server) rateKey(r *http.Request) string {
 	return "ip:" + ip.String()
 }
 
+const maxAuditTargetBytes = 128
+
+// truncateUTF8 returns s truncated to at most maxBytes bytes without splitting
+// a multi-byte UTF-8 sequence.
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		end = i
+	}
+	return s[:end]
+}
+
 func (s *Server) audit(r *http.Request, actor *store.User, action, namespace, target string) {
-	e := store.AuditEntry{At: s.now(), Action: action, Namespace: namespace, Target: target}
+	e := store.AuditEntry{At: s.now(), Action: action, Namespace: namespace, Target: truncateUTF8(target, maxAuditTargetBytes)}
 	if ip := s.clientIP(r); ip.IsValid() {
 		e.IP = ip.String()
 	}

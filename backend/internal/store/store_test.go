@@ -1,9 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,6 +78,55 @@ func TestTOTPReplayAndRecoveryCodes(t *testing.T) {
 	}
 	if ok, _ := s.UseRecoveryCode(ctx, u.ID, "r1", now); ok {
 		t.Fatal("recovery code reused")
+	}
+}
+
+func TestSetInvitePendingTOTPConditional(t *testing.T) {
+	ctx, s, now := context.Background(), open(t), time.Now()
+	inv, err := s.CreateInvite(ctx, "h-totp", Invite{CreatedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := s.SetInvitePendingTOTP(ctx, inv.ID, []byte("first-secret"))
+	if err != nil || !set {
+		t.Fatalf("first SetInvitePendingTOTP: set=%v err=%v", set, err)
+	}
+	set, err = s.SetInvitePendingTOTP(ctx, inv.ID, []byte("second-secret"))
+	if err != nil || set {
+		t.Fatalf("second SetInvitePendingTOTP: want (false, nil), got (%v, %v)", set, err)
+	}
+	got, err := s.InviteByTokenHash(ctx, "h-totp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.PendingTOTP, []byte("first-secret")) {
+		t.Fatalf("pending_totp overwritten: got %q, want %q", got.PendingTOTP, "first-secret")
+	}
+}
+
+func TestSQLiteDSNPragmaOrdering(t *testing.T) {
+	dsn := sqliteDSN("/tmp/test.db")
+	busyIdx := strings.Index(dsn, "_pragma=busy_timeout(5000)")
+	walIdx := strings.Index(dsn, "_pragma=journal_mode(WAL)")
+	fkIdx := strings.Index(dsn, "_pragma=foreign_keys(1)")
+	if busyIdx < 0 || walIdx < 0 || fkIdx < 0 {
+		t.Fatalf("missing expected pragmas in DSN: %q", dsn)
+	}
+	if busyIdx >= walIdx || busyIdx >= fkIdx {
+		t.Fatalf("busy_timeout must precede other pragmas in DSN: %q", dsn)
+	}
+
+	s := open(t)
+	var busy, fk int
+	var journal string
+	if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil || busy != 5000 {
+		t.Fatalf("busy_timeout: %d %v", busy, err)
+	}
+	if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
+		t.Fatalf("foreign_keys: %d %v", fk, err)
+	}
+	if err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil || strings.ToLower(journal) != "wal" {
+		t.Fatalf("journal_mode: %q %v", journal, err)
 	}
 }
 

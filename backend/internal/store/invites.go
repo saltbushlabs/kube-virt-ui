@@ -77,9 +77,16 @@ func (s *Store) ListInvites(ctx context.Context) ([]Invite, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) SetInvitePendingTOTP(ctx context.Context, id int64, sealed []byte) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE invites SET pending_totp = ? WHERE id = ?`, sealed, id)
-	return err
+// SetInvitePendingTOTP stores the sealed pending TOTP secret for invite id
+// only if none is set yet. It reports whether the update took effect.
+func (s *Store) SetInvitePendingTOTP(ctx context.Context, id int64, sealed []byte) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE invites SET pending_totp = ? WHERE id = ? AND pending_totp IS NULL`, sealed, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 func (s *Store) RevokeInvite(ctx context.Context, id int64, now time.Time) error {

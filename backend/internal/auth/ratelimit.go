@@ -1,28 +1,45 @@
 package auth
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
 
+const defaultMaxEntries = 10_000
+
 // FailureLimiter locks a key out after max failures within window.
 // State is in memory, which is correct for the single-replica deployment.
 type FailureLimiter struct {
-	max    int
-	window time.Duration
+	max           int
+	window        time.Duration
+	maxEntries    int
+	sweepInterval time.Duration
+	now           func() time.Time
 
-	mu      sync.Mutex
-	entries map[string]*failures
+	mu        sync.Mutex
+	entries   map[string]*failures
+	order     list.List // *failures ordered by reset time (oldest at front)
+	lastSweep time.Time
 }
 
 type failures struct {
+	key      string
 	count    int
 	inflight int // attempts Acquired but not yet Released
 	reset    time.Time
+	elem     *list.Element
 }
 
 func NewFailureLimiter(max int, window time.Duration) *FailureLimiter {
-	return &FailureLimiter{max: max, window: window, entries: map[string]*failures{}}
+	return &FailureLimiter{
+		max:           max,
+		window:        window,
+		maxEntries:    defaultMaxEntries,
+		sweepInterval: min(window, time.Minute),
+		now:           time.Now,
+		entries:       map[string]*failures{},
+	}
 }
 
 // Allowed reports whether key may make another attempt. Attempts that
@@ -36,8 +53,8 @@ func (l *FailureLimiter) Allowed(key string) bool {
 	if !ok {
 		return true
 	}
-	if time.Now().After(e.reset) && e.inflight == 0 {
-		delete(l.entries, key)
+	if l.now().After(e.reset) && e.inflight == 0 {
+		l.deleteEntry(e)
 		return true
 	}
 	return e.count+e.inflight < l.max
@@ -48,18 +65,20 @@ func (l *FailureLimiter) Allowed(key string) bool {
 func (l *FailureLimiter) Acquire(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := time.Now()
+	now := l.now()
 	e, ok := l.entries[key]
 	if ok && now.After(e.reset) && e.inflight == 0 {
-		delete(l.entries, key)
+		l.deleteEntry(e)
 		ok = false
 	}
 	if ok && e.count+e.inflight >= l.max {
 		return false
 	}
 	if !ok {
-		e = &failures{reset: now.Add(l.window)}
-		l.entries[key] = e
+		e = l.insertEntry(key, now)
+		if e == nil {
+			return false
+		}
 	}
 	e.inflight++
 	return true
@@ -72,42 +91,58 @@ func (l *FailureLimiter) Acquire(key string) bool {
 func (l *FailureLimiter) Release(key string, failed bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	e, ok := l.entries[key]
 	if !ok {
 		if !failed {
 			return
 		}
-		e = &failures{reset: time.Now().Add(l.window)}
-		l.entries[key] = e
+		e = l.insertEntry(key, now)
+		if e == nil {
+			return
+		}
 	}
 	if e.inflight > 0 {
 		e.inflight--
 	}
 	if failed {
-		e.count++
-		if len(l.entries) > 10_000 {
-			l.sweep(time.Now())
+		if now.After(e.reset) {
+			e.count = 0
+			e.reset = now.Add(l.window)
+			l.order.MoveToBack(e.elem)
 		}
+		e.count++
+		l.maybeSweep(now)
 		return
 	}
 	if e.count == 0 && e.inflight == 0 {
-		delete(l.entries, key)
+		l.deleteEntry(e)
 	}
 }
 
 func (l *FailureLimiter) Fail(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := time.Now()
+	now := l.now()
 	e, ok := l.entries[key]
-	if !ok || now.After(e.reset) {
-		e = &failures{reset: now.Add(l.window)}
-		l.entries[key] = e
+	if ok && now.After(e.reset) {
+		if e.inflight == 0 {
+			l.deleteEntry(e)
+			ok = false
+		} else {
+			e.count = 0
+			e.reset = now.Add(l.window)
+			l.order.MoveToBack(e.elem)
+		}
+	}
+	if !ok {
+		e = l.insertEntry(key, now)
+		if e == nil {
+			return
+		}
 	}
 	e.count++
-	if len(l.entries) > 10_000 {
-		l.sweep(now)
-	}
+	l.maybeSweep(now)
 }
 
 // Reset clears a key's failure count (after a successful login). Attempts
@@ -121,16 +156,68 @@ func (l *FailureLimiter) Reset(key string) {
 		return
 	}
 	if e.inflight == 0 {
-		delete(l.entries, key)
+		l.deleteEntry(e)
 		return
 	}
 	e.count = 0
 }
 
-func (l *FailureLimiter) sweep(now time.Time) {
-	for k, e := range l.entries {
-		if now.After(e.reset) && e.inflight == 0 {
-			delete(l.entries, k)
+// insertEntry adds a new limiter entry while keeping map size bounded at
+// maxEntries. When at capacity, it evicts the entry with the oldest reset time
+// (a tradeoff to bound memory against key-space exhaustion; a distributed
+// attacker with many source addresses already bypasses per-IP limits). If all
+// maxEntries slots are currently in flight, insertEntry returns nil and Acquire
+// fails closed (HTTP 429) until an in-flight request completes.
+func (l *FailureLimiter) insertEntry(key string, now time.Time) *failures {
+	l.maybeSweep(now)
+	for l.maxEntries > 0 && len(l.entries) >= l.maxEntries {
+		if !l.evictOldest() {
+			return nil
 		}
 	}
+	e := &failures{key: key, reset: now.Add(l.window)}
+	e.elem = l.order.PushBack(e)
+	l.entries[key] = e
+	return e
+}
+
+func (l *FailureLimiter) deleteEntry(e *failures) {
+	delete(l.entries, e.key)
+	if e.elem != nil {
+		l.order.Remove(e.elem)
+		e.elem = nil
+	}
+}
+
+func (l *FailureLimiter) evictOldest() bool {
+	for el := l.order.Front(); el != nil; el = el.Next() {
+		e := el.Value.(*failures)
+		if e.inflight == 0 {
+			l.deleteEntry(e)
+			return true
+		}
+	}
+	return false
+}
+
+func (l *FailureLimiter) maybeSweep(now time.Time) {
+	if !l.lastSweep.IsZero() && now.Sub(l.lastSweep) < l.sweepInterval {
+		return
+	}
+	l.sweep(now)
+}
+
+func (l *FailureLimiter) sweep(now time.Time) {
+	for el := l.order.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*failures)
+		if !now.After(e.reset) {
+			break
+		}
+		if e.inflight == 0 {
+			l.deleteEntry(e)
+		}
+		el = next
+	}
+	l.lastSweep = now
 }

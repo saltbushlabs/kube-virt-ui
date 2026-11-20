@@ -97,6 +97,12 @@ Dockerfile  builds both into one distroless image (published by .github/workflow
 ## Cluster prerequisites
 
 - **KubeVirt and CDI** installed; nodes with VT-x/AMD-V (`/dev/kvm`).
+- **KubeVirt's default `instancetype.kubevirt.io:view` ClusterRoleBinding**
+  (bound to `system:authenticated`). Stock KubeVirt installations create this
+  binding automatically, allowing tenant ServiceAccounts to list cluster-scoped
+  instance types and preferences. If it has been removed or restricted,
+  cluster-scoped instance types and preferences will not appear in the
+  create-VM form (namespaced ones still work, and the backend logs a warning).
 - **A CSI storage class.** RWX block storage (e.g. Rook-Ceph RBD) is needed
   for live migration.
 - **A CDI StorageProfile for every storage class users may pick.** CDI fills

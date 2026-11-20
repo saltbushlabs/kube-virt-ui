@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -74,15 +75,24 @@ func ListPreferences(ctx context.Context, dyn dynamic.Interface, namespace strin
 func listBoth(ctx context.Context, dyn dynamic.Interface, namespace string, cluster, namespaced schema.GroupVersionResource,
 	clusterKind, namespacedKind string, add func(*unstructured.Unstructured, string)) error {
 	sources := []struct {
-		res  dynamic.ResourceInterface
-		kind string
+		res          dynamic.ResourceInterface
+		kind         string
+		resource     string
+		clusterScope bool
 	}{
-		{dyn.Resource(cluster), clusterKind},
-		{dyn.Resource(namespaced).Namespace(namespace), namespacedKind},
+		{dyn.Resource(cluster), clusterKind, cluster.Resource, true},
+		{dyn.Resource(namespaced).Namespace(namespace), namespacedKind, namespaced.Resource, false},
 	}
 	for _, s := range sources {
 		list, err := s.res.List(ctx, metav1.ListOptions{})
-		if apierrors.IsForbidden(err) || apierrors.IsNotFound(err) {
+		if apierrors.IsForbidden(err) {
+			if s.clusterScope {
+				slog.Warn("cannot list cluster-scoped resource; check the instancetype.kubevirt.io:view ClusterRoleBinding",
+					"resource", s.resource, "namespace", namespace, "err", err)
+			}
+			continue
+		}
+		if apierrors.IsNotFound(err) {
 			continue
 		}
 		if err != nil {

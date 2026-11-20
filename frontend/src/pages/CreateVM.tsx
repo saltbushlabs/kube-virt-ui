@@ -335,7 +335,7 @@ export function CreateVMPage() {
                   style={{ fontFamily: 'monospace' }}
                   placeholder={'#cloud-config\npackages:\n  - nginx'}
                 />
-                {help('Replaces the generated cloud-config, including the SSH keys above. Visible to everyone in the namespace: do not put secrets here.')}
+                {help('Replaces the generated cloud-config, including the SSH keys above. Limited to 2 KiB inline. Visible to everyone in the namespace: do not put secrets here.')}
               </ExpandableSection>
             </CardBody>
           </Card>

@@ -76,7 +76,7 @@ func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer, middleware.CleanPath, securityHeaders)
+	r.Use(middleware.Recoverer, securityHeaders)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	r.Route("/api", func(r chi.Router) {

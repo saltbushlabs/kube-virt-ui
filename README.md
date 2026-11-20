@@ -143,6 +143,34 @@ Open the printed link to create the first administrator. Back up the generated
 `<release>-key` Secret: it encrypts the TOTP secrets, and losing it locks
 every user out of two-factor login.
 
+### GitOps (ArgoCD, Flux) and `helm template`
+
+**`existingSecret` is required when deploying via GitOps (`ArgoCD`, `Flux`) or
+`helm template`.**
+
+When `existingSecret` is empty, the chart's `Secret` template uses Helm's
+`lookup` function to preserve the generated `secret-key` across upgrades.
+Under `helm template` (used by ArgoCD, Flux template pipelines, and CI render
+workflows), `lookup` always returns empty, so every render or sync generates a
+new `secret-key` and overwrites the Secret (`helm.sh/resource-policy: keep`
+only prevents deletion on `helm uninstall`, not overwrites on `kubectl apply`
+or GitOps sync). Rotating or overwriting `secret-key` makes all stored TOTP
+secrets undecryptable and permanently locks every user out of two-factor login.
+
+Pre-create the Secret out-of-band (or manage it with External Secrets / Sealed
+Secrets) with a base64-encoded 32-byte key in `secret-key`, then pass its name
+via `existingSecret`:
+
+```sh
+kubectl create namespace kubevirt-ui
+kubectl -n kubevirt-ui create secret generic kvui-secret \
+  --from-literal=secret-key="$(openssl rand -base64 32)"
+
+helm template kvui deploy/helm/kubevirt-ui -n kubevirt-ui \
+  --set publicURL=https://vms.example.com \
+  --set existingSecret=kvui-secret
+```
+
 ## Tenant namespaces
 
 The chart does not know your tenant namespaces, so it cannot create their

@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
@@ -23,6 +27,10 @@ import (
 // fakeKubeVirt answers the few KubeVirt endpoints the VM handlers use and
 // records "METHOD path token" for each request.
 func (e *env) fakeKubeVirt(w http.ResponseWriter, r *http.Request) {
+	if e.kubeHandler != nil {
+		e.kubeHandler(w, r)
+		return
+	}
 	e.requests = append(e.requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
 	if r.URL.Query().Get("watch") == "true" {
 		// Hold the watch open without sending events until the client goes away.
@@ -357,5 +365,250 @@ func TestCreateVM(t *testing.T) {
 	}
 	if last := e.requests[len(e.requests)-1]; !strings.HasSuffix(last, "Bearer tok-team-a-kvui-u1") {
 		t.Fatalf("not created as alice: %s", last)
+	}
+}
+
+func TestWriteSSEFailureEncodingAndSanitization(t *testing.T) {
+	t.Run("4xx StatusError with control chars produces valid JSON", func(t *testing.T) {
+		logs := captureLogs(t)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/namespaces/team-a/watch/vms", nil)
+		rawMsg := "bad\x07bell\x0bvtab\nnewline\"quote\\slash"
+		err := &apierrors.StatusError{ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusForbidden,
+			Reason:  metav1.StatusReasonForbidden,
+			Message: rawMsg,
+		}}
+
+		writeSSEFailure(rec, req, rec, err)
+		body := rec.Body.String()
+		const prefix = "event: failure\ndata: "
+		if !strings.HasPrefix(body, prefix) || !strings.HasSuffix(body, "\n\n") {
+			t.Fatalf("unexpected SSE frame: %q", body)
+		}
+		payload := strings.TrimSuffix(strings.TrimPrefix(body, prefix), "\n\n")
+		var decoded string
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			t.Fatalf("SSE failure payload is not valid JSON (%s): %v", payload, err)
+		}
+		if decoded != rawMsg {
+			t.Fatalf("decoded = %q, want %q", decoded, rawMsg)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("unexpected internal error log for 4xx: %s", logs.String())
+		}
+	})
+
+	t.Run("non-kube and 5xx errors are sanitized and logged", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			err    error
+			secret string
+		}{
+			{
+				name:   "raw network error",
+				err:    errors.New("dial tcp 10.96.0.1:443: connect: connection refused"),
+				secret: "10.96.0.1:443",
+			},
+			{
+				name:   "5xx StatusError",
+				err:    apierrors.NewInternalError(errors.New("etcdserver: mvcc: database space exceeded")),
+				secret: "etcdserver",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				logs := captureLogs(t)
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/api/namespaces/team-a/watch/vms", nil)
+				writeSSEFailure(rec, req, rec, tc.err)
+
+				body := rec.Body.String()
+				if strings.Contains(body, tc.secret) {
+					t.Fatalf("SSE failure leaked internal detail: %s", body)
+				}
+				payload := strings.TrimSuffix(strings.TrimPrefix(body, "event: failure\ndata: "), "\n\n")
+				var decoded string
+				if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+					t.Fatalf("invalid JSON (%s): %v", payload, err)
+				}
+				if decoded != "internal error" {
+					t.Fatalf("decoded = %q, want %q", decoded, "internal error")
+				}
+				if !strings.Contains(logs.String(), tc.secret) {
+					t.Fatalf("expected real error to be logged, got: %s", logs.String())
+				}
+			})
+		}
+	})
+}
+
+// TestWatchVMsNoDuplicateListAndSanitizedFailure verifies that watchVMs:
+//  1. performs the initial List before opening Watches and passes each list's
+//     ResourceVersion to Watch (avoiding an immediate duplicate List on connect),
+//  2. encodes refresh failure SSE payloads as valid JSON with sanitized 5xx errors.
+func TestWatchVMsNoDuplicateListAndSanitizedFailure(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_, link, _ := CreateInvite(ctx, e.store, "https://ui.test", store.Invite{
+		Namespace: "team-a", Role: "operator", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+	alice := e.client()
+	e.redeem(alice, link, "alice")
+
+	var mu sync.Mutex
+	var listCount int
+	var watchRVs = map[string]string{}
+	var failNextList atomic.Bool
+	triggerWatch := make(chan struct{}, 1)
+	var watchReady atomic.Bool
+
+	e.kubeHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("watch") == "true" {
+			mu.Lock()
+			watchRVs[r.URL.Path] = r.URL.Query().Get("resourceVersion")
+			listsBeforeWatch := listCount
+			mu.Unlock()
+			if listsBeforeWatch < 3 {
+				t.Errorf("watch %s opened before initial 3 Lists completed (lists=%d)", r.URL.Path, listsBeforeWatch)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			f, _ := w.(http.Flusher)
+			if f != nil {
+				f.Flush()
+			}
+			if strings.HasSuffix(r.URL.Path, "/virtualmachines") {
+				watchReady.Store(true)
+				select {
+				case <-triggerWatch:
+					_, _ = w.Write([]byte(`{"type":"MODIFIED","object":{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","metadata":{"name":"web","namespace":"team-a"}}}` + "\n"))
+					if f != nil {
+						f.Flush()
+					}
+				case <-r.Context().Done():
+					return
+				}
+			}
+			<-r.Context().Done()
+			return
+		}
+
+		mu.Lock()
+		listCount++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if failNextList.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"InternalError","code":500,"message":"secret-backend-boom"}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/apis/kubevirt.io/v1/namespaces/team-a/virtualmachines":
+			_, _ = w.Write([]byte(`{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachineList","metadata":{"resourceVersion":"101"},"items":[
+				{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","metadata":{"name":"web","namespace":"team-a"},
+				 "spec":{"runStrategy":"Always"},"status":{"printableStatus":"Running","ready":true}}]}`))
+		case "/apis/kubevirt.io/v1/namespaces/team-a/virtualmachineinstances":
+			_, _ = w.Write([]byte(`{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachineInstanceList","metadata":{"resourceVersion":"202"},"items":[]}`))
+		case "/apis/cdi.kubevirt.io/v1beta1/namespaces/team-a/datavolumes":
+			_, _ = w.Write([]byte(`{"apiVersion":"cdi.kubevirt.io/v1beta1","kind":"DataVolumeList","metadata":{"resourceVersion":"303"},"items":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/namespaces/team-a/watch/vms", nil)
+	req.Header.Set("X-Requested-With", "kvui")
+	resp, err := alice.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("watch status = %d", resp.StatusCode)
+	}
+
+	lines := make(chan string, 32)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+
+	// Wait for initial VM list.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatal("stream ended before initial list")
+			}
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"web"`) {
+				goto gotInitial
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for initial list")
+		}
+	}
+gotInitial:
+
+	// Wait longer than watchDebounce and verify no duplicate List happened.
+	time.Sleep(watchDebounce + 150*time.Millisecond)
+	mu.Lock()
+	if listCount != 3 {
+		t.Fatalf("expected exactly 3 initial List calls, got %d", listCount)
+	}
+	wantRVs := map[string]string{
+		"/apis/kubevirt.io/v1/namespaces/team-a/virtualmachines":         "101",
+		"/apis/kubevirt.io/v1/namespaces/team-a/virtualmachineinstances": "202",
+		"/apis/cdi.kubevirt.io/v1beta1/namespaces/team-a/datavolumes":    "303",
+	}
+	for path, want := range wantRVs {
+		if got := watchRVs[path]; got != want {
+			t.Errorf("watch %s resourceVersion = %q, want %q", path, got, want)
+		}
+	}
+	mu.Unlock()
+	if !watchReady.Load() {
+		t.Fatal("VM watch did not open")
+	}
+
+	// Trigger a watch event and fail the debounced refresh List with a 500 error.
+	failNextList.Store(true)
+	triggerWatch <- struct{}{}
+
+	var sawFailureEvent bool
+	var failureData string
+	deadline = time.After(5 * time.Second)
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				goto streamDone
+			}
+			if line == "event: failure" {
+				sawFailureEvent = true
+			} else if sawFailureEvent && strings.HasPrefix(line, "data: ") {
+				failureData = strings.TrimPrefix(line, "data: ")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for failure event and stream close")
+		}
+	}
+streamDone:
+	if !sawFailureEvent || failureData == "" {
+		t.Fatalf("missing SSE failure event (seen=%v data=%q)", sawFailureEvent, failureData)
+	}
+	if strings.Contains(failureData, "secret-backend-boom") {
+		t.Fatalf("SSE failure leaked internal error: %s", failureData)
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(failureData), &decoded); err != nil {
+		t.Fatalf("SSE failure data not valid JSON (%s): %v", failureData, err)
+	}
+	if decoded != "internal error" {
+		t.Fatalf("SSE failure decoded = %q, want %q", decoded, "internal error")
 	}
 }

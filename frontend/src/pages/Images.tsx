@@ -202,14 +202,16 @@ export function ImagesPage() {
     setError('')
   }
 
-  // Poll while CDI is still processing something; pause while an error is
-  // shown so persistent 401/403 responses don't keep polling every 10s.
+  // Poll while CDI is still processing something; only pause on persistent
+  // auth/permission errors (401/403) so transient network or 5xx failures
+  // recover automatically on the next poll.
   const pending = images.data?.some((i) => i.phase !== 'Succeeded' && !i.problem)
+  const authError = images.errorStatus === 401 || images.errorStatus === 403
   useEffect(() => {
-    if (images.error) return
+    if (authError) return
     const t = setInterval(reload, pending ? 2000 : 10000)
     return () => clearInterval(t)
-  }, [reload, pending, images.error])
+  }, [reload, pending, authError])
 
   async function remove(name: string) {
     setDeleting(true)

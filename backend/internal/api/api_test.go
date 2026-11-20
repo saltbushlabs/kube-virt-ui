@@ -370,7 +370,7 @@ func TestSecurityHeadersAndCacheControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	const wantHSTS = "max-age=31536000; includeSubDomains"
+	const wantHSTS = "max-age=31536000"
 	if hsts := resp.Header.Get("Strict-Transport-Security"); hsts != wantHSTS {
 		t.Errorf("healthz HSTS with SecureCookies=true = %q, want %q", hsts, wantHSTS)
 	}

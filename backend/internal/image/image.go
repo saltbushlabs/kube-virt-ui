@@ -222,6 +222,9 @@ func (p *UploadProxy) client(ctx context.Context) (*http.Client, error) {
 		serverName = u.Hostname()
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep HTTP/1.1 to cdi-uploadproxy so Expect: 100-continue and the
+	// retry-on-502/503 loop preserve the existing upload behavior.
+	transport.ForceAttemptHTTP2 = false
 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: serverName, MinVersion: tls.VersionTLS12}
 	transport.Proxy = http.ProxyFromEnvironment
 	// With Expect: 100-continue the body is only sent once the proxy

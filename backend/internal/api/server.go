@@ -136,7 +136,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		// Invite tokens live in the URL path; never leak them via Referer.
 		h.Set("Referrer-Policy", "no-referrer")
 		if s.SecureCookies {
-			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -128,6 +128,9 @@ func TestUploadProxyClientTransport(t *testing.T) {
 	if tr.Proxy == nil {
 		t.Error("Proxy is nil")
 	}
+	if tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 = true, want false to keep HTTP/1.1 for cdi-uploadproxy")
+	}
 	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS12 || tr.TLSClientConfig.ServerName != "cdi-uploadproxy.cdi.svc" {
 		t.Errorf("unexpected TLSClientConfig: %+v", tr.TLSClientConfig)
 	}

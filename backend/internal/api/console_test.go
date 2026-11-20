@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -150,14 +151,18 @@ func TestConsoleProxy(t *testing.T) {
 }
 
 func TestSameOrigin(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 	cases := []struct {
-		name          string
-		publicURL     string
-		secureCookies bool
-		tls           bool
-		host          string
-		origin        string
-		want          bool
+		name           string
+		publicURL      string
+		secureCookies  bool
+		trustedProxies []netip.Prefix
+		remoteAddr     string
+		forwardedProto string
+		tls            bool
+		host           string
+		origin         string
+		want           bool
 	}{
 		{
 			name:          "public url exact match",
@@ -184,7 +189,7 @@ func TestSameOrigin(t *testing.T) {
 			want:          false,
 		},
 		{
-			name:          "secure cookies rejects http even matching host",
+			name:          "public url scheme mismatch rejected even when matching host",
 			publicURL:     "https://ui.test",
 			secureCookies: true,
 			host:          "ui.test",
@@ -192,20 +197,45 @@ func TestSameOrigin(t *testing.T) {
 			want:          false,
 		},
 		{
-			name:          "secure cookies accepts https matching host behind tls ingress",
-			publicURL:     "https://other.test",
+			name:          "kubectl port-forward over plain http works with secure cookies",
+			publicURL:     "https://ui.test",
 			secureCookies: true,
-			host:          "ui.test",
-			origin:        "https://ui.test",
+			host:          "localhost:8080",
+			origin:        "http://localhost:8080",
 			want:          true,
 		},
 		{
-			name:          "secure cookies rejects http public url",
-			publicURL:     "http://ui.test",
-			secureCookies: true,
-			host:          "kvui.internal:8080",
-			origin:        "http://ui.test",
-			want:          false,
+			name:           "trusted proxy forwarded https accepts https host",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "10.0.0.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "https://ui.test",
+			want:           true,
+		},
+		{
+			name:           "trusted proxy forwarded https rejects http host",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "10.0.0.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "http://ui.test",
+			want:           false,
+		},
+		{
+			name:           "untrusted proxy forwarded https is ignored",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "198.51.100.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "https://ui.test",
+			want:           false,
 		},
 		{
 			name:          "insecure plain http host match",
@@ -269,9 +299,15 @@ func TestSameOrigin(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := New(Options{PublicURL: tc.publicURL, SecureCookies: tc.secureCookies})
+			s := New(Options{PublicURL: tc.publicURL, SecureCookies: tc.secureCookies, TrustedProxies: tc.trustedProxies})
 			r := httptest.NewRequest(http.MethodGet, "/api/namespaces/team-a/vms/web/vnc", nil)
 			r.Host = tc.host
+			if tc.remoteAddr != "" {
+				r.RemoteAddr = tc.remoteAddr
+			}
+			if tc.forwardedProto != "" {
+				r.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
 			if tc.tls {
 				r.TLS = &tls.ConnectionState{}
 			}

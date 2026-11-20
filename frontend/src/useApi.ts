@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from './api'
+import { api, ApiError } from './api'
 
 // useApi GETs path and exposes the result with a reload function. When the
 // path changes the previous result is cleared and any in-flight request is
@@ -8,6 +8,7 @@ import { api } from './api'
 export function useApi<T>(path: string) {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState('')
+  const [errorStatus, setErrorStatus] = useState<number | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   // Reset during render when the path changes (React's recommended
@@ -17,6 +18,7 @@ export function useApi<T>(path: string) {
     setPrevPath(path)
     setData(null)
     setError('')
+    setErrorStatus(null)
   }
 
   const reload = useCallback(async () => {
@@ -28,9 +30,13 @@ export function useApi<T>(path: string) {
       if (!ac.signal.aborted) {
         setData(result)
         setError('')
+        setErrorStatus(null)
       }
     } catch (e) {
-      if (!ac.signal.aborted) setError((e as Error).message)
+      if (!ac.signal.aborted) {
+        setError((e as Error).message)
+        setErrorStatus(e instanceof ApiError ? e.status : null)
+      }
     }
   }, [path])
 
@@ -39,7 +45,10 @@ export function useApi<T>(path: string) {
     return () => abortRef.current?.abort()
   }, [reload])
 
-  const clearError = useCallback(() => setError(''), [])
+  const clearError = useCallback(() => {
+    setError('')
+    setErrorStatus(null)
+  }, [])
 
-  return { data, error, reload, clearError }
+  return { data, error, errorStatus, reload, clearError }
 }

@@ -76,11 +76,11 @@ func (s *Server) CloseStreams() { s.closeStreams() }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer, securityHeaders)
+	r.Use(middleware.Recoverer, s.securityHeaders)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	r.Route("/api", func(r chi.Router) {
-		r.Use(requireCSRFHeader)
+		r.Use(noStore, requireCSRFHeader)
 		r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 			writeError(w, http.StatusNotFound, "not found")
 		})
@@ -131,13 +131,23 @@ func (s *Server) Handler() http.Handler {
 	return r
 }
 
-func securityHeaders(next http.Handler) http.Handler {
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		// Invite tokens live in the URL path; never leak them via Referer.
 		h.Set("Referrer-Policy", "no-referrer")
+		if s.SecureCookies {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -267,8 +277,29 @@ func (s *Server) rateKey(r *http.Request) string {
 	return "ip:" + ip.String()
 }
 
+const maxAuditTargetBytes = 128
+
+// truncateUTF8 returns s truncated to at most maxBytes bytes without splitting
+// a multi-byte UTF-8 sequence.
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		end = i
+	}
+	return s[:end]
+}
+
 func (s *Server) audit(r *http.Request, actor *store.User, action, namespace, target string) {
-	e := store.AuditEntry{At: s.now(), Action: action, Namespace: namespace, Target: target}
+	e := store.AuditEntry{At: s.now(), Action: action, Namespace: namespace, Target: truncateUTF8(target, maxAuditTargetBytes)}
 	if ip := s.clientIP(r); ip.IsValid() {
 		e.IP = ip.String()
 	}

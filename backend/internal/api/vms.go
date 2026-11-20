@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -105,17 +106,32 @@ func (s *Server) clientsFor(w http.ResponseWriter, r *http.Request) (userClients
 	return userClients{namespace: ns, role: m.Role, cfg: cfg, kube: kube, dyn: dyn}, true
 }
 
-// kubeError relays apiserver refusals (forbidden, not found, conflict) to
-// the user and treats anything else as an internal error.
-func kubeError(w http.ResponseWriter, r *http.Request, err error) {
+// kubeErrorStatus maps apiserver refusals (4xx) to their status code and
+// user-facing message, and logs anything else while returning a generic 500
+// message so internal or network details do not leak.
+func kubeErrorStatus(r *http.Request, err error) (int, string) {
 	var status apierrors.APIStatus
 	if errors.As(err, &status) {
 		if code := int(status.Status().Code); code >= 400 && code < 500 {
-			writeError(w, code, status.Status().Message)
-			return
+			return code, status.Status().Message
 		}
 	}
-	internalError(w, r, err)
+	slog.Error("request failed", "method", r.Method, "route", routePattern(r), "err", err)
+	return http.StatusInternalServerError, "internal error"
+}
+
+// kubeError relays apiserver refusals (forbidden, not found, conflict) to
+// the user and treats anything else as an internal error.
+func kubeError(w http.ResponseWriter, r *http.Request, err error) {
+	code, msg := kubeErrorStatus(r, err)
+	writeError(w, code, msg)
+}
+
+func writeSSEFailure(w http.ResponseWriter, r *http.Request, flusher http.Flusher, err error) {
+	_, msg := kubeErrorStatus(r, err)
+	data, _ := json.Marshal(msg)
+	fmt.Fprintf(w, "event: failure\ndata: %s\n\n", data) // #nosec G705 -- text/event-stream with nosniff, never rendered as HTML
+	flusher.Flush()
 }
 
 // access returns what the current user may do in a namespace, as computed by
@@ -203,7 +219,13 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// End with the server's streams (shutdown) as well as with the request.
 	defer context.AfterFunc(s.streamCtx, cancel)()
-	changes, err := vm.Watch(ctx, c.dyn, c.namespace)
+
+	vms, rvs, err := vm.ListWithRVs(ctx, c.dyn, c.namespace)
+	if err != nil {
+		kubeError(w, r, err)
+		return
+	}
+	changes, err := vm.Watch(ctx, c.dyn, c.namespace, rvs)
 	if err != nil {
 		kubeError(w, r, err)
 		return
@@ -211,26 +233,27 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-cache, no-store")
 	h.Set("X-Accel-Buffering", "no") // disable nginx ingress buffering
 	fmt.Fprint(w, "retry: 2000\n\n")
 
-	send := func() bool {
+	sendList := func(list []vm.Summary) {
+		data, _ := json.Marshal(list)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	sendList(vms)
+
+	refresh := func() bool {
 		vms, err := vm.List(ctx, c.dyn, c.namespace)
 		if err != nil {
 			if ctx.Err() == nil {
-				fmt.Fprintf(w, "event: failure\ndata: %q\n\n", err.Error()) // #nosec G705 -- text/event-stream with nosniff, never rendered as HTML
-				flusher.Flush()
+				writeSSEFailure(w, r, flusher, err)
 			}
 			return false
 		}
-		data, _ := json.Marshal(vms)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+		sendList(vms)
 		return true
-	}
-	if !send() {
-		return
 	}
 
 	heartbeat := time.NewTicker(watchHeartbeat)
@@ -238,6 +261,7 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 	recheck := time.NewTicker(s.consoleRecheck)
 	defer recheck.Stop()
 	debounce := time.NewTimer(0)
+	defer debounce.Stop()
 	<-debounce.C
 	for {
 		select {
@@ -249,7 +273,7 @@ func (s *Server) watchVMs(w http.ResponseWriter, r *http.Request) {
 			}
 			debounce.Reset(watchDebounce)
 		case <-debounce.C:
-			if !send() {
+			if !refresh() {
 				return
 			}
 		case <-recheck.C:

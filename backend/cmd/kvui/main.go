@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -76,6 +77,10 @@ func loadConfig() (config, error) {
 	if c.publicURL == "" {
 		return c, errors.New("KVUI_PUBLIC_URL is required (used in invite links)")
 	}
+	u, err := url.Parse(c.publicURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" {
+		return c, errors.New("KVUI_PUBLIC_URL must be a valid http:// or https:// URL with a host")
+	}
 	c.secretKey, err = base64.StdEncoding.DecodeString(os.Getenv("KVUI_SECRET_KEY"))
 	if err != nil || len(c.secretKey) != 32 {
 		return c, errors.New("KVUI_SECRET_KEY must be 32 bytes, base64 encoded (openssl rand -base64 32)")
@@ -133,9 +138,7 @@ func run() error {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "admin-invite":
-			now := time.Now()
-			_, link, err := api.CreateInvite(context.Background(), st, cfg.publicURL,
-				store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)})
+			link, err := createAdminInvite(context.Background(), st, cfg.publicURL, time.Now())
 			if err != nil {
 				return err
 			}
@@ -183,7 +186,7 @@ func run() error {
 	defer stop()
 	go purgeSessions(ctx, st)
 
-	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := newHTTPServer(cfg.listen, srv.Handler())
 	// When shutdown starts, end the long-lived streams at once so they do
 	// not hold it open; ordinary in-flight requests are left to finish.
 	httpSrv.RegisterOnShutdown(srv.CloseStreams)
@@ -193,6 +196,15 @@ func run() error {
 	}
 	slog.Info("listening", "addr", cfg.listen)
 	return serveHTTP(ctx, ln, httpSrv)
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 var shutdownTimeout = 10 * time.Second
@@ -228,6 +240,34 @@ func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server) error {
 	return err
 }
 
+const auditRetention = 90 * 24 * time.Hour
+
+func createAdminInvite(ctx context.Context, st *store.Store, publicURL string, now time.Time) (string, error) {
+	_, link, err := api.CreateInvite(ctx, st, publicURL,
+		store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)})
+	if err != nil {
+		return "", err
+	}
+	if err := st.Audit(ctx, store.AuditEntry{
+		At:     now,
+		Actor:  "cli",
+		Action: "invite.create",
+		Target: "admin",
+	}); err != nil {
+		slog.Error("audit write failed", "action", "invite.create", "err", err)
+	}
+	return link, nil
+}
+
+func purgeOnce(ctx context.Context, st *store.Store, now time.Time) {
+	if err := st.PurgeExpiredSessions(ctx, now); err != nil {
+		slog.Error("purge sessions", "err", err)
+	}
+	if err := st.PurgeAudit(ctx, now.Add(-auditRetention)); err != nil {
+		slog.Error("purge audit", "err", err)
+	}
+}
+
 func purgeSessions(ctx context.Context, st *store.Store) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
@@ -236,9 +276,7 @@ func purgeSessions(ctx context.Context, st *store.Store) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := st.PurgeExpiredSessions(ctx, time.Now()); err != nil {
-				slog.Error("purge sessions", "err", err)
-			}
+			purgeOnce(ctx, st, time.Now())
 		}
 	}
 }

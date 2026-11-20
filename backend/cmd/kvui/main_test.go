@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"kvui/internal/store"
 )
 
 func serveForTest(t *testing.T, srv *http.Server) (addr string, cancel context.CancelFunc, serveErr chan error) {
@@ -120,5 +126,150 @@ func TestServeHTTPShutdownDrainsRequests(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("serveHTTP did not return after draining")
+	}
+}
+
+func TestLoadConfigPublicURL(t *testing.T) {
+	validKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+
+	setBase := func(t *testing.T, publicURL string) {
+		t.Helper()
+		t.Setenv("KVUI_SECRET_KEY", validKey)
+		t.Setenv("KVUI_PUBLIC_URL", publicURL)
+		t.Setenv("KVUI_INSECURE_COOKIES", "")
+		t.Setenv("KVUI_TRUST_PROXY", "")
+		t.Setenv("KVUI_TRUSTED_PROXIES", "")
+	}
+
+	for _, valid := range []string{
+		"https://vms.example.com",
+		"http://localhost:5173",
+		"HTTPS://vms.example.com:8443/sub",
+		"https://[::1]:8443",
+	} {
+		t.Run("valid/"+valid, func(t *testing.T) {
+			setBase(t, valid)
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatalf("loadConfig(%q): unexpected error: %v", valid, err)
+			}
+			if cfg.publicURL != valid {
+				t.Fatalf("publicURL = %q, want %q", cfg.publicURL, valid)
+			}
+		})
+	}
+
+	for _, invalid := range []string{
+		"",
+		"vms.example.com",
+		"ftp://vms.example.com",
+		"javascript:alert(1)",
+		"https://",
+		"https:///path",
+		"https://:8080",
+		"://bad",
+	} {
+		t.Run("invalid/"+invalid, func(t *testing.T) {
+			setBase(t, invalid)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig(%q): expected error, got nil", invalid)
+			}
+		})
+	}
+}
+
+func TestNewHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer(":8080", http.NotFoundHandler())
+	if srv.Addr != ":8080" {
+		t.Errorf("Addr = %q, want :8080", srv.Addr)
+	}
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 10s", srv.ReadHeaderTimeout)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Errorf("IdleTimeout = %v, want 120s", srv.IdleTimeout)
+	}
+}
+
+func TestCreateAdminInviteAudits(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	now := time.Unix(1_700_000_000, 0)
+	link, err := createAdminInvite(ctx, st, "https://ui.test", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(link, "https://ui.test/invite/") {
+		t.Fatalf("unexpected invite link: %q", link)
+	}
+	invs, err := st.ListInvites(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invs) != 1 || !invs[0].MakeAdmin {
+		t.Fatalf("invites: %+v", invs)
+	}
+	entries, err := st.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 audit entry, got %+v", entries)
+	}
+	got := entries[0]
+	if got.ActorID != nil || got.Actor != "cli" || got.Action != "invite.create" || got.Namespace != "" || got.Target != "admin" || !got.At.Equal(now) {
+		t.Fatalf("unexpected audit entry: %+v", got)
+	}
+}
+
+func TestPurgeOnce(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	now := time.Unix(1_700_000_000, 0)
+	inv, err := st.CreateInvite(ctx, "h1", store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := st.RedeemInviteNewUser(ctx, inv, store.User{Username: "alice", PasswordHash: "x", TOTPSecret: []byte("s")}, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctx, "expired", u.ID, now.Add(-2*time.Hour), now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctx, "active", u.ID, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Audit(ctx, store.AuditEntry{At: now.Add(-auditRetention - time.Second), Actor: "cli", Action: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Audit(ctx, store.AuditEntry{At: now.Add(-time.Hour), Actor: "cli", Action: "recent"}); err != nil {
+		t.Fatal(err)
+	}
+
+	purgeOnce(ctx, st, now)
+
+	if _, err := st.SessionUser(ctx, "expired", now.Add(-2*time.Minute)); err != store.ErrNotFound {
+		t.Fatalf("expired session not purged: %v", err)
+	}
+	if _, err := st.SessionUser(ctx, "active", now); err != nil {
+		t.Fatalf("active session purged: %v", err)
+	}
+	entries, err := st.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Action != "recent" {
+		t.Fatalf("remaining audit entries: %+v", entries)
 	}
 }

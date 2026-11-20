@@ -37,6 +37,7 @@ export function VMPage() {
   const [tab, setTab] = useState<string | number>('details')
   // Consoles need a running instance and operator or owner rights.
   const consoleDisabled = !vm || !['Running', 'Paused'].includes(vm.status) || !role || role === 'viewer'
+  const activeTab = consoleDisabled && tab !== 'details' ? 'details' : tab
 
   const field = (term: string, value: React.ReactNode) => (
     <DescriptionListGroup>
@@ -81,7 +82,7 @@ export function VMPage() {
               {d.problem}
             </Alert>
           ))}
-          <Tabs activeKey={tab} onSelect={(_, k) => setTab(k)} mountOnEnter unmountOnExit>
+          <Tabs activeKey={activeTab} onSelect={(_, k) => setTab(k)} mountOnEnter unmountOnExit>
             <Tab eventKey="details" title={<TabTitleText>Details</TabTitleText>}>
               <Card style={{ marginTop: 16 }}>
                 <CardBody>

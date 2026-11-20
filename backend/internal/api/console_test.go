@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -111,6 +114,12 @@ func TestConsoleProxy(t *testing.T) {
 	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"https://evil.test"}}); err == nil || resp.StatusCode != 403 {
 		t.Fatalf("cross-origin handshake accepted: %v", err)
 	}
+	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"http://ui.test"}}); err == nil || resp.StatusCode != 403 {
+		t.Fatalf("scheme-mismatched PublicURL handshake accepted: %v", err)
+	}
+	if _, resp, err := dialer.Dial(base+"web/vnc", http.Header{"Origin": {"https://" + strings.TrimPrefix(e.srv.URL, "http://")}}); err == nil || resp.StatusCode != 403 {
+		t.Fatalf("scheme-mismatched host handshake accepted: %v", err)
+	}
 	if _, resp, err := dialer.Dial(base+"off/vnc", sameOrigin); err == nil || resp.StatusCode != 404 {
 		t.Fatalf("upstream refusal not relayed: %v", err)
 	}
@@ -138,5 +147,176 @@ func TestConsoleProxy(t *testing.T) {
 	_, _, err = conn.ReadMessage()
 	if !websocket.IsCloseError(err, websocket.ClosePolicyViolation) {
 		t.Fatalf("console not closed on revocation: %v", err)
+	}
+}
+
+func TestSameOrigin(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	cases := []struct {
+		name           string
+		publicURL      string
+		secureCookies  bool
+		trustedProxies []netip.Prefix
+		remoteAddr     string
+		forwardedProto string
+		tls            bool
+		host           string
+		origin         string
+		want           bool
+	}{
+		{
+			name:          "public url exact match",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "kvui.internal:8080",
+			origin:        "https://ui.test",
+			want:          true,
+		},
+		{
+			name:          "public url case-insensitive scheme and host",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "kvui.internal:8080",
+			origin:        "HTTPS://UI.TEST",
+			want:          true,
+		},
+		{
+			name:          "public url scheme mismatch http vs https",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "kvui.internal:8080",
+			origin:        "http://ui.test",
+			want:          false,
+		},
+		{
+			name:          "public url scheme mismatch rejected even when matching host",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "ui.test",
+			origin:        "http://ui.test",
+			want:          false,
+		},
+		{
+			name:          "kubectl port-forward over plain http works with secure cookies",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "localhost:8080",
+			origin:        "http://localhost:8080",
+			want:          true,
+		},
+		{
+			name:           "trusted proxy forwarded https accepts https host",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "10.0.0.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "https://ui.test",
+			want:           true,
+		},
+		{
+			name:           "trusted proxy forwarded https rejects http host",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "10.0.0.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "http://ui.test",
+			want:           false,
+		},
+		{
+			name:           "untrusted proxy forwarded https is ignored",
+			publicURL:      "https://other.test",
+			secureCookies:  true,
+			trustedProxies: trusted,
+			remoteAddr:     "198.51.100.5:43210",
+			forwardedProto: "https",
+			host:           "ui.test",
+			origin:         "https://ui.test",
+			want:           false,
+		},
+		{
+			name:          "insecure plain http host match",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "http://localhost:8080",
+			want:          true,
+		},
+		{
+			name:          "insecure plain http rejects https host mismatch",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "https://localhost:8080",
+			want:          false,
+		},
+		{
+			name:          "direct tls accepts https host",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			tls:           true,
+			host:          "localhost:8443",
+			origin:        "https://localhost:8443",
+			want:          true,
+		},
+		{
+			name:          "direct tls rejects http host",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			tls:           true,
+			host:          "localhost:8443",
+			origin:        "http://localhost:8443",
+			want:          false,
+		},
+		{
+			name:          "missing origin rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: true,
+			host:          "ui.test",
+			origin:        "",
+			want:          false,
+		},
+		{
+			name:          "schemeless origin rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "ui.test",
+			origin:        "//ui.test",
+			want:          false,
+		},
+		{
+			name:          "ws scheme rejected",
+			publicURL:     "https://ui.test",
+			secureCookies: false,
+			host:          "localhost:8080",
+			origin:        "ws://localhost:8080",
+			want:          false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Options{PublicURL: tc.publicURL, SecureCookies: tc.secureCookies, TrustedProxies: tc.trustedProxies})
+			r := httptest.NewRequest(http.MethodGet, "/api/namespaces/team-a/vms/web/vnc", nil)
+			r.Host = tc.host
+			if tc.remoteAddr != "" {
+				r.RemoteAddr = tc.remoteAddr
+			}
+			if tc.forwardedProto != "" {
+				r.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
+			if tc.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if got := s.sameOrigin(r); got != tc.want {
+				t.Errorf("sameOrigin() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

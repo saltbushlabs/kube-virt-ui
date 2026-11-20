@@ -3,11 +3,14 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"kvui/internal/auth"
 	"kvui/internal/vm"
@@ -20,18 +23,38 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
+// requestScheme returns "https" when r arrived over TLS or via a trusted
+// proxy that forwarded X-Forwarded-Proto: https, and "http" otherwise.
+func (s *Server) requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if peer, err := netip.ParseAddrPort(r.RemoteAddr); err == nil && s.trustedProxy(peer.Addr().Unmap()) {
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			if i := strings.IndexByte(proto, ','); i >= 0 {
+				proto = proto[:i]
+			}
+			if strings.EqualFold(strings.TrimSpace(proto), "https") {
+				return "https"
+			}
+		}
+	}
+	return "http"
+}
+
 // sameOrigin rejects cross-site websocket handshakes. Websockets are GETs, so
 // the X-Requested-With CSRF check does not cover them.
 func (s *Server) sameOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	if err != nil || origin.Host == "" {
+	if err != nil || origin.Host == "" || origin.Scheme == "" {
 		return false
 	}
-	if origin.Host == r.Host {
-		return true
+	if public, err := url.Parse(s.PublicURL); err == nil && public.Host != "" && public.Scheme != "" {
+		if strings.EqualFold(origin.Host, public.Host) {
+			return strings.EqualFold(origin.Scheme, public.Scheme)
+		}
 	}
-	public, err := url.Parse(s.PublicURL)
-	return err == nil && origin.Host == public.Host
+	return strings.EqualFold(origin.Host, r.Host) && strings.EqualFold(origin.Scheme, s.requestScheme(r))
 }
 
 // console proxies the browser's websocket to KubeVirt's VNC or serial
@@ -54,6 +77,11 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 	// running) reach the browser as ordinary HTTP errors.
 	upstream, err := vm.DialConsole(r.Context(), c.cfg, c.namespace, name, kind)
 	if err != nil {
+		// DialConsole uses gorilla/websocket rather than c.cfg's HTTP
+		// transport, so invalidate the cached token here on 401 as well.
+		if apierrors.IsUnauthorized(err) {
+			s.Tenants.InvalidateToken(c.namespace, currentUser(r).ID)
+		}
 		kubeError(w, r, err)
 		return
 	}

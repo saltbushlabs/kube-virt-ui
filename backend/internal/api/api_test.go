@@ -31,10 +31,11 @@ type env struct {
 	store *store.Store
 	clock time.Time
 	// apiserver stands in for the KubeVirt API; requests holds what it saw.
-	apiserver *httptest.Server
-	requests  []string
-	created   []byte // body of the last VM create the fake apiserver received
-	api       *Server
+	apiserver   *httptest.Server
+	kubeHandler http.HandlerFunc // optional override for fakeKubeVirt
+	requests    []string
+	created     []byte // body of the last VM create the fake apiserver received
+	api         *Server
 }
 
 func newEnv(t *testing.T) *env {

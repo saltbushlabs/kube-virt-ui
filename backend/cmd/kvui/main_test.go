@@ -7,8 +7,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"kvui/internal/store"
 )
 
 func serveForTest(t *testing.T, srv *http.Server) (addr string, cancel context.CancelFunc, serveErr chan error) {
@@ -184,5 +188,88 @@ func TestNewHTTPServerTimeouts(t *testing.T) {
 	}
 	if srv.IdleTimeout != 120*time.Second {
 		t.Errorf("IdleTimeout = %v, want 120s", srv.IdleTimeout)
+	}
+}
+
+func TestCreateAdminInviteAudits(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	now := time.Unix(1_700_000_000, 0)
+	link, err := createAdminInvite(ctx, st, "https://ui.test", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(link, "https://ui.test/invite/") {
+		t.Fatalf("unexpected invite link: %q", link)
+	}
+	invs, err := st.ListInvites(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invs) != 1 || !invs[0].MakeAdmin {
+		t.Fatalf("invites: %+v", invs)
+	}
+	entries, err := st.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 audit entry, got %+v", entries)
+	}
+	got := entries[0]
+	if got.ActorID != nil || got.Actor != "cli" || got.Action != "invite.create" || got.Namespace != "" || got.Target != "admin" || !got.At.Equal(now) {
+		t.Fatalf("unexpected audit entry: %+v", got)
+	}
+}
+
+func TestPurgeOnce(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	now := time.Unix(1_700_000_000, 0)
+	inv, err := st.CreateInvite(ctx, "h1", store.Invite{MakeAdmin: true, CreatedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := st.RedeemInviteNewUser(ctx, inv, store.User{Username: "alice", PasswordHash: "x", TOTPSecret: []byte("s")}, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctx, "expired", u.ID, now.Add(-2*time.Hour), now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(ctx, "active", u.ID, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Audit(ctx, store.AuditEntry{At: now.Add(-auditRetention - time.Second), Actor: "cli", Action: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Audit(ctx, store.AuditEntry{At: now.Add(-time.Hour), Actor: "cli", Action: "recent"}); err != nil {
+		t.Fatal(err)
+	}
+
+	purgeOnce(ctx, st, now)
+
+	if _, err := st.SessionUser(ctx, "expired", now.Add(-2*time.Minute)); err != store.ErrNotFound {
+		t.Fatalf("expired session not purged: %v", err)
+	}
+	if _, err := st.SessionUser(ctx, "active", now); err != nil {
+		t.Fatalf("active session purged: %v", err)
+	}
+	entries, err := st.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Action != "recent" {
+		t.Fatalf("remaining audit entries: %+v", entries)
 	}
 }

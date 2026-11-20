@@ -62,8 +62,10 @@ func invalid(format string, args ...any) error {
 }
 
 const (
-	maxCPUs     = 128
-	maxUserData = 16 << 10
+	maxCPUs = 128
+	// KubeVirt's admission webhook caps inline cloudInitNoCloud.userData
+	// at 2048 bytes (cloudInitUserMaxLen).
+	maxUserData = 2048
 )
 
 var (
@@ -106,10 +108,10 @@ func (r *CreateRequest) Validate() error {
 	r.DiskURL = strings.TrimSpace(r.DiskURL)
 	switch r.DiskSource {
 	case SourceRegistry, SourceContainerDisk:
-		if r.DiskURL == "" || strings.ContainsAny(r.DiskURL, " \t\n") {
+		r.DiskURL = strings.TrimPrefix(r.DiskURL, "docker://")
+		if r.DiskURL == "" || strings.ContainsAny(r.DiskURL, " \t\n\r") {
 			return invalid("enter a container image, e.g. quay.io/containerdisks/fedora:latest")
 		}
-		r.DiskURL = strings.TrimPrefix(r.DiskURL, "docker://")
 	case SourceHTTP:
 		if err := checkImportURL(r.DiskURL); err != nil {
 			return err
@@ -163,7 +165,10 @@ func (r *CreateRequest) Validate() error {
 	}
 	r.SSHKeys = keys
 	if len(r.UserData) > maxUserData {
-		return invalid("user data is limited to 16 KiB")
+		return invalid("user data is limited to 2 KiB")
+	}
+	if len(r.CloudConfig()) > maxUserData {
+		return invalid("SSH keys exceed the 2 KiB cloud-init limit")
 	}
 	return nil
 }

@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -56,55 +57,112 @@ type Disk struct {
 	Problem  string `json:"problem,omitempty"`  // error reported by CDI
 }
 
+// WatchVersions holds the collection ResourceVersions returned by ListWithRVs
+// so Watch can resume from that snapshot without re-receiving synthetic ADDED
+// events for existing objects.
+type WatchVersions struct {
+	VMs  string
+	VMIs string
+	DVs  string
+}
+
 // List returns all VMs in namespace, sorted by name.
 func List(ctx context.Context, dyn dynamic.Interface, namespace string) ([]Summary, error) {
+	out, _, err := ListWithRVs(ctx, dyn, namespace)
+	return out, err
+}
+
+// ListWithRVs returns all VMs in namespace, sorted by name, along with the
+// list ResourceVersions for VMs, VMIs, and DataVolumes (empty when CDI is not
+// installed).
+func ListWithRVs(ctx context.Context, dyn dynamic.Interface, namespace string) ([]Summary, WatchVersions, error) {
 	vms, err := dyn.Resource(VMs).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, err
+		return nil, WatchVersions{}, err
 	}
-	vmis, err := byName(ctx, dyn, VMIs, namespace)
+	vmis, vmiRV, err := byName(ctx, dyn, VMIs, namespace)
 	if err != nil {
-		return nil, err
+		return nil, WatchVersions{}, err
 	}
-	dvs, err := byName(ctx, dyn, DVs, namespace)
+	dvs, dvRV, err := byName(ctx, dyn, DVs, namespace)
 	if apierrors.IsNotFound(err) {
-		dvs, err = nil, nil // CDI not installed
+		dvs, dvRV, err = nil, "", nil // CDI not installed
 	}
 	if err != nil {
-		return nil, err
+		return nil, WatchVersions{}, err
 	}
 	out := make([]Summary, 0, len(vms.Items))
 	for i := range vms.Items {
 		out = append(out, summarize(&vms.Items[i], vmis[vms.Items[i].GetName()], dvs))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out, WatchVersions{
+		VMs:  vms.GetResourceVersion(),
+		VMIs: vmiRV,
+		DVs:  dvRV,
+	}, nil
 }
 
-func byName(ctx context.Context, dyn dynamic.Interface, res schema.GroupVersionResource, namespace string) (map[string]*unstructured.Unstructured, error) {
+func byName(ctx context.Context, dyn dynamic.Interface, res schema.GroupVersionResource, namespace string) (map[string]*unstructured.Unstructured, string, error) {
 	list, err := dyn.Resource(res).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	m := make(map[string]*unstructured.Unstructured, len(list.Items))
 	for i := range list.Items {
 		m[list.Items[i].GetName()] = &list.Items[i]
 	}
-	return m, nil
+	return m, list.GetResourceVersion(), nil
 }
 
-// Get returns one VM's summary.
+// Get returns one VM's summary using targeted Get calls for the VM, its
+// running instance (if any), and the DataVolumes it references.
 func Get(ctx context.Context, dyn dynamic.Interface, namespace, name string) (Summary, error) {
-	all, err := List(ctx, dyn, namespace)
+	vmObj, err := dyn.Resource(VMs).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return Summary{}, err
 	}
-	for _, s := range all {
-		if s.Name == name {
-			return s, nil
+	vmi, err := dyn.Resource(VMIs).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		vmi, err = nil, nil
+	}
+	if err != nil {
+		return Summary{}, err
+	}
+	var dvs map[string]*unstructured.Unstructured
+	if dvNames := dataVolumeNames(vmObj.Object); len(dvNames) > 0 {
+		dvs = make(map[string]*unstructured.Unstructured, len(dvNames))
+		for _, dvName := range dvNames {
+			if _, seen := dvs[dvName]; seen {
+				continue
+			}
+			dv, err := dyn.Resource(DVs).Namespace(namespace).Get(ctx, dvName, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				dvs[dvName] = nil // DataVolume absent or CDI not installed
+				continue
+			}
+			if err != nil {
+				return Summary{}, err
+			}
+			dvs[dvName] = dv
 		}
 	}
-	return Summary{}, apierrors.NewNotFound(VMs.GroupResource(), name)
+	return summarize(vmObj, vmi, dvs), nil
+}
+
+func dataVolumeNames(obj map[string]any) []string {
+	volumes, _, _ := unstructured.NestedSlice(obj, "spec", "template", "spec", "volumes")
+	var names []string
+	for _, v := range volumes {
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue // malformed volume entry; not a reason to fail the whole list
+		}
+		if name, _, _ := unstructured.NestedString(m, "dataVolume", "name"); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func summarize(vm, vmi *unstructured.Unstructured, dvs map[string]*unstructured.Unstructured) Summary {
@@ -160,13 +218,7 @@ func summarize(vm, vmi *unstructured.Unstructured, dvs map[string]*unstructured.
 		s.Status = "Unknown"
 	}
 
-	volumes, _, _ := unstructured.NestedSlice(obj, "spec", "template", "spec", "volumes")
-	for _, v := range volumes {
-		m, ok := v.(map[string]any)
-		if !ok {
-			continue // malformed volume entry; not a reason to fail the whole list
-		}
-		name, _, _ := unstructured.NestedString(m, "dataVolume", "name")
+	for _, name := range dataVolumeNames(obj) {
 		if dv := dvs[name]; dv != nil {
 			s.Disks = append(s.Disks, diskStatus(dv))
 		}
@@ -224,6 +276,11 @@ func Do(ctx context.Context, rc rest.Interface, namespace, name, action string) 
 		return fmt.Errorf("unknown action %q", action)
 	}
 	resourceType, verb, _ := strings.Cut(sub, "/")
+	// name comes from the request path; AbsPath joins segments with path.Join,
+	// so anything but a valid object name could escape the tenant's namespace.
+	if len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "kubevirt.io", Resource: resourceType}, name)
+	}
 	return rc.Put().
 		AbsPath("/apis/subresources.kubevirt.io/v1/namespaces", namespace, resourceType, name, verb).
 		SetHeader("Content-Type", "application/json").
@@ -232,13 +289,21 @@ func Do(ctx context.Context, rc rest.Interface, namespace, name, action string) 
 }
 
 // Watch signals on the returned channel whenever a VM, VM instance or
-// DataVolume in namespace changes. The channel is closed when ctx ends or
-// any watch is closed by the apiserver; callers then re-establish it.
-func Watch(ctx context.Context, dyn dynamic.Interface, namespace string) (<-chan struct{}, error) {
+// DataVolume in namespace changes after rvs. The channel is closed when ctx
+// ends or any watch is closed by the apiserver; callers then re-establish it.
+func Watch(ctx context.Context, dyn dynamic.Interface, namespace string, rvs WatchVersions) (<-chan struct{}, error) {
+	targets := []struct {
+		res schema.GroupVersionResource
+		rv  string
+	}{
+		{VMs, rvs.VMs},
+		{VMIs, rvs.VMIs},
+		{DVs, rvs.DVs},
+	}
 	var watches []watch.Interface
-	for _, res := range []schema.GroupVersionResource{VMs, VMIs, DVs} {
-		w, err := dyn.Resource(res).Namespace(namespace).Watch(ctx, metav1.ListOptions{})
-		if res == DVs && apierrors.IsNotFound(err) {
+	for _, t := range targets {
+		w, err := dyn.Resource(t.res).Namespace(namespace).Watch(ctx, metav1.ListOptions{ResourceVersion: t.rv})
+		if t.res == DVs && apierrors.IsNotFound(err) {
 			continue // CDI not installed
 		}
 		if err != nil {
@@ -266,8 +331,8 @@ func Watch(ctx context.Context, dyn dynamic.Interface, namespace string) (<-chan
 					return
 				case <-stop:
 					return
-				case _, ok := <-w.ResultChan():
-					if !ok {
+				case ev, ok := <-w.ResultChan():
+					if !ok || ev.Type == watch.Error {
 						return
 					}
 					select {

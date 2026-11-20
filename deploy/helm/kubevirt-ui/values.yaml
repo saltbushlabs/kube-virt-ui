@@ -6,9 +6,20 @@ image:
 # External URL users reach the UI on. Used to build invite links.
 publicURL: https://vms.example.com
 
-# Name of an existing Secret with key `secret-key` (32 random bytes, base64).
-# Leave empty to have the chart generate one and keep it across upgrades.
-# Losing this key makes every enrolled TOTP authenticator unusable.
+# Name of an existing Secret in the release namespace with key `secret-key`
+# (32 random bytes, base64-encoded, e.g. from `openssl rand -base64 32`).
+#
+# REQUIRED when deploying via GitOps (ArgoCD, Flux) or `helm template`:
+# The chart's default Secret template uses Helm's `lookup` function to preserve
+# the generated key across upgrades. Under `helm template` (used by ArgoCD,
+# Flux template pipelines, and CI render workflows), `lookup` always returns
+# empty, so every render/sync generates a new `secret-key` and overwrites the
+# Secret (`helm.sh/resource-policy: keep` does not stop `kubectl apply` or
+# ArgoCD from updating Secret data). Rotating or losing this key makes all
+# stored TOTP secrets undecryptable, permanently locking users out of login.
+#
+# Leave empty only for direct `helm install`/`helm upgrade` workflows (and back
+# up the generated `<release>-key` Secret).
 existingSecret: ""
 
 # Namespace CDI is installed in. The backend streams image uploads to its

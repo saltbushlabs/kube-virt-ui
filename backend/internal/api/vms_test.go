@@ -105,6 +105,9 @@ func TestVMListAndActionsUseUserToken(t *testing.T) {
 	if st := e.do(alice, "POST", "/api/namespaces/team-a/vms/web/destroy", nil, nil); st != 404 {
 		t.Fatalf("unknown action: %d", st)
 	}
+	if st := e.do(alice, "POST", "/api/namespaces/team-a/vms/Web/restart", nil, nil); st != 404 {
+		t.Fatalf("invalid vm name: %d", st)
+	}
 	if st := e.do(alice, "GET", "/api/namespaces/other/vms", nil, nil); st != 403 {
 		t.Fatalf("non-member namespace: %d", st)
 	}

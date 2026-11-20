@@ -1,8 +1,10 @@
 package vm
 
 import (
+	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/json"
 )
@@ -81,5 +83,17 @@ func TestSummarizeDisks(t *testing.T) {
 		{"type":"Running","status":"True","reason":"Pod is running"}]}}`)
 	if d := summarize(vm, nil, dvs).Disks[0]; d.Progress != "45.20%" || d.Problem != "" {
 		t.Fatalf("%+v", d)
+	}
+}
+
+func TestDoRejectsPathNames(t *testing.T) {
+	// nil client: a bad name must be refused before any request is built.
+	for _, action := range []string{"start", "pause"} {
+		for _, name := range []string{"", "..", "../../other-ns/virtualmachines/web", "a/b", "web/start", "Web"} {
+			err := Do(context.Background(), nil, "team-a", name, action)
+			if !apierrors.IsNotFound(err) {
+				t.Errorf("action %q name %q: got %v, want not found", action, name, err)
+			}
+		}
 	}
 }

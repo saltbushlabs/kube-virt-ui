@@ -162,6 +162,12 @@ func (l *FailureLimiter) Reset(key string) {
 	e.count = 0
 }
 
+// insertEntry adds a new limiter entry while keeping map size bounded at
+// maxEntries. When at capacity, it evicts the entry with the oldest reset time
+// (a tradeoff to bound memory against key-space exhaustion; a distributed
+// attacker with many source addresses already bypasses per-IP limits). If all
+// maxEntries slots are currently in flight, insertEntry returns nil and Acquire
+// fails closed (HTTP 429) until an in-flight request completes.
 func (l *FailureLimiter) insertEntry(key string, now time.Time) *failures {
 	l.maybeSweep(now)
 	for l.maxEntries > 0 && len(l.entries) >= l.maxEntries {

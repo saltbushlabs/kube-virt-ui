@@ -41,7 +41,9 @@ func CreateInvite(ctx context.Context, st *store.Store, publicURL string, inv st
 // in the URL, writing the error response itself (and releasing the attempt)
 // when it is rate-limited, unknown or no longer usable. On success the caller
 // must invoke the returned release function with whether the request counted
-// as a failed attempt.
+// as a failed attempt. Note that Acquire counts in-flight GET and POST /totp
+// requests toward the per-IP concurrency cap for the duration of the request
+// (so concurrent page loads or clients behind a shared NAT share those slots).
 func (s *Server) usableInvite(w http.ResponseWriter, r *http.Request) (store.Invite, func(failed bool), bool) {
 	ipKey := s.rateKey(r)
 	if !s.inviteLimiter.Acquire(ipKey) {

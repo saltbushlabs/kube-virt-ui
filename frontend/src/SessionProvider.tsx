@@ -1,15 +1,15 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api, ApiError, type Me } from './api'
+import { SessionContext } from './session'
 
-interface Session {
-  me: Me | null
-  loading: boolean
-  error: string | null
-  refresh: () => Promise<void>
-  logout: () => Promise<void>
+async function fetchMe(): Promise<Me | null> {
+  try {
+    return await api<Me>('GET', '/me')
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401)) throw e
+    return null
+  }
 }
-
-const SessionContext = createContext<Session | null>(null)
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<Me | null>(null)
@@ -19,17 +19,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     try {
-      const next = await api<Me>('GET', '/me')
+      const next = await fetchMe()
       meRef.current = next
       setMe(next)
       setError(null)
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) {
-        meRef.current = null
-        setMe(null)
-        setError(null)
-        return
-      }
       // Only record a session load error when no active session exists;
       // otherwise a transient background refresh failure would leave a stale
       // error in context while `me` stays populated.
@@ -50,14 +44,27 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    void refresh().catch(() => {})
-  }, [refresh])
+    let cancelled = false
+    fetchMe()
+      .then((user) => {
+        if (!cancelled) {
+          meRef.current = user
+          setMe(user)
+          setError(null)
+        }
+      })
+      .catch((e) => {
+        if (!cancelled && !meRef.current) {
+          setError(e instanceof Error && e.message ? e.message : 'Failed to verify session')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   return <SessionContext.Provider value={{ me, loading, error, refresh, logout }}>{children}</SessionContext.Provider>
-}
-
-export function useSession(): Session {
-  const s = useContext(SessionContext)
-  if (!s) throw new Error('useSession outside SessionProvider')
-  return s
 }

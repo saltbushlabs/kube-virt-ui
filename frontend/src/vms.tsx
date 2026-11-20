@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   Button,
   Content,
@@ -14,50 +14,8 @@ import {
   ModalHeader,
   TextInput,
 } from '@patternfly/react-core'
-import { api, availableActions, vmPath, type Disk, type PowerAction, type Role, type VM } from './api'
-import { useSession } from './session'
-
-// useVMWatch subscribes to the namespace's live VM list over server-sent
-// events. EventSource reconnects by itself after the server's periodic
-// stream cut; a refused reconnect (e.g. session expiry or membership
-// removed) closes it, clears stale VM data, and re-checks the session.
-export function useVMWatch(ns: string) {
-  const { refresh } = useSession()
-  const [vms, setVms] = useState<VM[] | null>(null)
-  const [error, setError] = useState('')
-
-  // Clear the previous namespace's list during render when ns changes, so
-  // it is not shown (or acted on) under the new namespace's title while
-  // its stream connects.
-  const [prevNs, setPrevNs] = useState(ns)
-  if (prevNs !== ns) {
-    setPrevNs(ns)
-    setVms(null)
-    setError('')
-  }
-
-  useEffect(() => {
-    let closed = false
-    const es = new EventSource('/api' + vmPath(ns) + '/watch/vms')
-    es.onmessage = (e) => {
-      setVms(JSON.parse(e.data))
-      setError('')
-    }
-    es.addEventListener('failure', (e) => setError(JSON.parse((e as MessageEvent).data)))
-    es.onerror = () => {
-      if (closed || es.readyState !== EventSource.CLOSED) return
-      setVms(null)
-      setError('Live updates stopped. Reload the page to retry.')
-      void refresh().catch(() => {})
-    }
-    return () => {
-      closed = true
-      es.close()
-    }
-  }, [ns, refresh])
-
-  return { vms, error }
-}
+import { api, availableActions, vmPath, type PowerAction, type Role, type VM } from './api'
+import { diskNote } from './vmHelpers'
 
 const statusColors: Record<string, 'green' | 'grey' | 'orange' | 'blue' | 'red'> = {
   Running: 'green',
@@ -73,16 +31,6 @@ const statusColors: Record<string, 'green' | 'grey' | 'orange' | 'blue' | 'red'>
 
 export function VMStatus({ status }: { status: string }) {
   return <Label color={statusColors[status] ?? 'red'}>{status}</Label>
-}
-
-// diskNote explains a disk that is not ready yet: a CDI problem, or import
-// progress.
-export function diskNote(d: Disk): { text: string; problem: boolean } | null {
-  if (d.problem) return { text: `${d.name}: ${d.problem}`, problem: true }
-  // Storage that binds on first use prepares the disk when the VM first starts.
-  if (d.phase === 'WaitForFirstConsumer') return { text: `${d.name}: prepared on first start`, problem: false }
-  if (d.phase && d.phase !== 'Succeeded') return { text: `${d.name}: ${d.phase}${d.progress ? ' ' + d.progress : ''}`, problem: false }
-  return null
 }
 
 // VMStatusCell shows the status plus, while provisioning, why it is waiting.
@@ -234,9 +182,4 @@ export function PowerMenu({
       </Modal>
     </>
   )
-}
-
-export function vmSize(vm: VM): string {
-  if (vm.instancetype) return vm.instancetype
-  return [vm.cpus ? `${vm.cpus} vCPU` : '', vm.memory ?? ''].filter(Boolean).join(', ') || '—'
 }

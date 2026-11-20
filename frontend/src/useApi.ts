@@ -1,6 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from './api'
 
+async function loadPath<T>(
+  path: string,
+  abortRef: { current: AbortController | null },
+  onData: (result: T) => void,
+  onError: (msg: string) => void,
+  onErrorStatus: (status: number | null) => void,
+) {
+  abortRef.current?.abort()
+  const ac = new AbortController()
+  abortRef.current = ac
+  try {
+    const result = await api<T>('GET', path, undefined, ac.signal)
+    if (!ac.signal.aborted) {
+      onData(result)
+      onError('')
+      onErrorStatus(null)
+    }
+  } catch (e) {
+    if (!ac.signal.aborted) {
+      onError((e as Error).message)
+      onErrorStatus(e instanceof ApiError ? e.status : null)
+    }
+  }
+}
+
 // useApi GETs path and exposes the result with a reload function. When the
 // path changes the previous result is cleared and any in-flight request is
 // aborted, so one namespace's data is never shown under another's title and
@@ -21,29 +46,16 @@ export function useApi<T>(path: string) {
     setErrorStatus(null)
   }
 
+  const abort = useCallback(() => abortRef.current?.abort(), [])
+
   const reload = useCallback(async () => {
-    abortRef.current?.abort()
-    const ac = new AbortController()
-    abortRef.current = ac
-    try {
-      const result = await api<T>('GET', path, undefined, ac.signal)
-      if (!ac.signal.aborted) {
-        setData(result)
-        setError('')
-        setErrorStatus(null)
-      }
-    } catch (e) {
-      if (!ac.signal.aborted) {
-        setError((e as Error).message)
-        setErrorStatus(e instanceof ApiError ? e.status : null)
-      }
-    }
+    await loadPath(path, abortRef, setData, setError, setErrorStatus)
   }, [path])
 
   useEffect(() => {
-    reload()
-    return () => abortRef.current?.abort()
-  }, [reload])
+    void loadPath(path, abortRef, setData, setError, setErrorStatus)
+    return abort
+  }, [path, abort])
 
   const clearError = useCallback(() => {
     setError('')

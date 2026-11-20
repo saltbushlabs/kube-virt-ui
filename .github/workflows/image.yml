@@ -37,12 +37,21 @@ jobs:
           node-version: 26
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Frontend lint and build
+      - name: Frontend lint, test and build
         working-directory: frontend
         run: |
           npm ci
           npm run lint
+          npm test
           npm run build
+
+      - uses: azure/setup-helm@v4
+      - name: Helm lint and template
+        run: |
+          helm lint deploy/helm/kubevirt-ui
+          helm template kvui deploy/helm/kubevirt-ui > /dev/null
+          helm template kvui deploy/helm/kubevirt-ui --set ingress.enabled=true --set 'trustedProxies[0]=10.244.0.0/16' > /dev/null
+          helm template kvui deploy/helm/kubevirt-ui --set admissionPolicy.enabled=false > /dev/null
 
   # Security scans. Any finding fails the run and so blocks publishing;
   # suppress gosec false positives in code with "#nosec <rule> -- reason".

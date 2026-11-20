@@ -1,10 +1,9 @@
 import '@patternfly/react-core/dist/styles/base.css'
-import { StrictMode, useState } from 'react'
+import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
-import { Alert, Bullseye, Button, EmptyState, EmptyStateActions, EmptyStateBody, EmptyStateFooter, Spinner } from '@patternfly/react-core'
-import { SessionProvider, useSession } from './session'
-import { Layout } from './Layout'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { SessionProvider } from './SessionProvider'
+import { RequireUser } from './RequireUser'
 import { LoginPage } from './pages/Login'
 import { InvitePage } from './pages/Invite'
 import { HomePage } from './pages/Home'
@@ -15,51 +14,6 @@ import { ImagesPage } from './pages/Images'
 import { InvitesPage } from './pages/admin/Invites'
 import { UsersPage } from './pages/admin/Users'
 import { AuditPage } from './pages/admin/Audit'
-
-function RequireUser({ admin, children }: { admin?: boolean; children: React.ReactNode }) {
-  const { me, loading, error, refresh } = useSession()
-  const [retrying, setRetrying] = useState(false)
-  const location = useLocation()
-  if (loading)
-    return (
-      <Bullseye>
-        <Spinner />
-      </Bullseye>
-    )
-  if (!me && error)
-    return (
-      <Bullseye style={{ minHeight: '100vh', padding: 16 }}>
-        <EmptyState titleText="Unable to verify session" headingLevel="h1">
-          <EmptyStateBody>
-            <Alert variant="danger" isInline title={error} />
-          </EmptyStateBody>
-          <EmptyStateFooter>
-            <EmptyStateActions>
-              <Button
-                isLoading={retrying}
-                isDisabled={retrying}
-                onClick={async () => {
-                  setRetrying(true)
-                  try {
-                    await refresh()
-                  } catch {
-                    // Error state is tracked by SessionProvider.
-                  } finally {
-                    setRetrying(false)
-                  }
-                }}
-              >
-                Retry
-              </Button>
-            </EmptyStateActions>
-          </EmptyStateFooter>
-        </EmptyState>
-      </Bullseye>
-    )
-  if (!me) return <Navigate to={`/login?next=${encodeURIComponent(location.pathname + location.search + location.hash)}`} replace />
-  if (admin && !me.user.isAdmin) return <Navigate to="/" replace />
-  return <Layout>{children}</Layout>
-}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

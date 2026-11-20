@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   ActionGroup,
@@ -78,7 +78,7 @@ export function CreateVMPage() {
   const ready = (type: Image['type']) => (images.data ?? []).filter((i) => i.type === type && i.phase === 'Succeeded')
 
   const [name, setName] = useState('')
-  const [sizeMode, setSizeMode] = useState<'instancetype' | 'custom'>('instancetype')
+  const [preferredSizeMode, setSizeMode] = useState<'instancetype' | 'custom'>('instancetype')
   const [instancetype, setInstancetype] = useState('')
   const [cpus, setCpus] = useState(2)
   // Memory and disk size are kept as text so the field can be emptied
@@ -100,9 +100,7 @@ export function CreateVMPage() {
 
   const opts = options.data
   // Fall back to a custom size where the cluster offers no instancetypes.
-  useEffect(() => {
-    if (opts && opts.instancetypes.length === 0) setSizeMode('custom')
-  }, [opts])
+  const sizeMode: 'instancetype' | 'custom' = opts && opts.instancetypes.length === 0 ? 'custom' : preferredSizeMode
 
   const source = sources.find((s) => s.value === diskSource)!
   const persistent = diskSource !== 'containerdisk'

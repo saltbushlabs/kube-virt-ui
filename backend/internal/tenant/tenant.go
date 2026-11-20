@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -34,6 +35,8 @@ const (
 
 	tokenTTL     = 10 * time.Minute // TokenRequest minimum
 	tokenRefresh = 2 * time.Minute
+
+	maxRoleBindingAttempts = 3
 )
 
 var ErrNotTenant = errors.New("namespace is not a kubevirt-ui tenant namespace")
@@ -55,13 +58,24 @@ func ClusterRoleName(role string) string { return "kubevirt-ui-" + role }
 
 func accountName(userID int64) string { return fmt.Sprintf("kvui-u%d", userID) }
 
+func membershipKey(namespace string, userID int64) string {
+	return namespace + "/" + accountName(userID)
+}
+
 type Provisioner struct {
 	client kubernetes.Interface
 	base   *rest.Config
 
 	mu      sync.Mutex
+	locks   map[string]*keyLock    // key: namespace/account; serializes Ensure/Remove/token
 	tokens  map[string]cachedToken // key: namespace/account
 	ensured map[string]string      // key: namespace/account; role last fully applied by Ensure
+}
+
+type keyLock struct {
+	ch   chan struct{} // capacity 1; a value in ch means the lock is held
+	refs int
+	gen  uint64 // bumped on Remove and InvalidateToken to reject stale cache writes
 }
 
 type cachedToken struct {
@@ -70,19 +84,102 @@ type cachedToken struct {
 }
 
 func NewProvisioner(client kubernetes.Interface, base *rest.Config) *Provisioner {
-	return &Provisioner{client: client, base: base, tokens: map[string]cachedToken{}, ensured: map[string]string{}}
+	return &Provisioner{
+		client:  client,
+		base:    base,
+		locks:   map[string]*keyLock{},
+		tokens:  map[string]cachedToken{},
+		ensured: map[string]string{},
+	}
 }
 
-func (p *Provisioner) markEnsured(namespace string, userID int64, role string) {
+// acquireKey serializes Ensure, Remove, and token calls for one
+// (namespace, userID) key. When invalidate is true, cached token and ensured
+// state are dropped and the key's generation is bumped before waiting on the
+// lock so an in-flight call cannot write stale state back.
+func (p *Provisioner) acquireKey(ctx context.Context, key string, invalidate bool) (*keyLock, func(), error) {
 	p.mu.Lock()
-	p.ensured[namespace+"/"+accountName(userID)] = role
+	kl := p.locks[key]
+	if kl == nil {
+		kl = &keyLock{ch: make(chan struct{}, 1)}
+		p.locks[key] = kl
+	}
+	if invalidate {
+		delete(p.tokens, key)
+		delete(p.ensured, key)
+		kl.gen++
+	}
+	if err := ctx.Err(); err != nil {
+		if kl.refs == 0 {
+			delete(p.locks, key)
+		}
+		p.mu.Unlock()
+		return nil, nil, err
+	}
+	kl.refs++
+	p.mu.Unlock()
+
+	select {
+	case kl.ch <- struct{}{}:
+		return kl, func() {
+			p.mu.Lock()
+			kl.refs--
+			if kl.refs == 0 {
+				delete(p.locks, key)
+			}
+			<-kl.ch
+			p.mu.Unlock()
+		}, nil
+	case <-ctx.Done():
+		p.mu.Lock()
+		kl.refs--
+		if kl.refs == 0 {
+			delete(p.locks, key)
+		}
+		p.mu.Unlock()
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (p *Provisioner) markEnsured(key string, kl *keyLock, gen uint64, role string) {
+	p.mu.Lock()
+	if kl.gen == gen {
+		p.ensured[key] = role
+	}
 	p.mu.Unlock()
 }
 
 func (p *Provisioner) ensuredRole(namespace string, userID int64) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.ensured[namespace+"/"+accountName(userID)]
+	return p.ensured[membershipKey(namespace, userID)]
+}
+
+// InvalidateToken drops any cached token and ensured state for a membership
+// so the next UserConfig call re-verifies the ServiceAccount and RoleBinding
+// and mints a fresh token.
+func (p *Provisioner) InvalidateToken(namespace string, userID int64) {
+	key := membershipKey(namespace, userID)
+	p.mu.Lock()
+	delete(p.tokens, key)
+	delete(p.ensured, key)
+	if kl := p.locks[key]; kl != nil {
+		kl.gen++
+	}
+	p.mu.Unlock()
+}
+
+func (p *Provisioner) invalidateTokenIf(namespace string, userID int64, token string) {
+	key := membershipKey(namespace, userID)
+	p.mu.Lock()
+	if c, ok := p.tokens[key]; ok && c.token == token {
+		delete(p.tokens, key)
+		delete(p.ensured, key)
+		if kl := p.locks[key]; kl != nil {
+			kl.gen++
+		}
+	}
+	p.mu.Unlock()
 }
 
 // Namespaces lists tenant namespaces.
@@ -113,6 +210,12 @@ func (p *Provisioner) CheckTenant(ctx context.Context, namespace string) error {
 	return nil
 }
 
+func roleBindingMatches(existing, want *rbacv1.RoleBinding) bool {
+	return existing.RoleRef == want.RoleRef &&
+		len(existing.Subjects) == 1 &&
+		existing.Subjects[0] == want.Subjects[0]
+}
+
 // Ensure makes the ServiceAccount and RoleBinding for a membership exist and
 // match role. It is idempotent and safe to call on every membership change.
 func (p *Provisioner) Ensure(ctx context.Context, namespace string, userID int64, username, role string) error {
@@ -123,6 +226,17 @@ func (p *Provisioner) Ensure(ctx context.Context, namespace string, userID int64
 		return err
 	}
 	name := accountName(userID)
+	key := membershipKey(namespace, userID)
+	kl, unlock, err := p.acquireKey(ctx, key, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	p.mu.Lock()
+	gen := kl.gen
+	p.mu.Unlock()
+
 	meta := metav1.ObjectMeta{
 		Name:        name,
 		Namespace:   namespace,
@@ -141,35 +255,63 @@ func (p *Provisioner) Ensure(ctx context.Context, namespace string, userID int64
 		Subjects:   []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: name, Namespace: namespace}},
 	}
 	rbs := p.client.RbacV1().RoleBindings(namespace)
-	existing, err := rbs.Get(ctx, name, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-	case err != nil:
-		return err
-	case existing.RoleRef == want.RoleRef && len(existing.Subjects) == 1 && existing.Subjects[0] == want.Subjects[0]:
-		p.markEnsured(namespace, userID, role)
-		return nil
-	default:
-		// roleRef is immutable, so a role change is delete and recreate.
-		if err := rbs.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete rolebinding: %w", err)
+	var createErr error
+	for range maxRoleBindingAttempts {
+		existing, err := rbs.Get(ctx, name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return err
+		case roleBindingMatches(existing, want):
+			p.markEnsured(key, kl, gen, role)
+			return nil
+		default:
+			// roleRef is immutable, so a role change is delete and recreate.
+			// Drop ensured first so a failure between Delete and Create does
+			// not leave a stale ensured role behind.
+			p.mu.Lock()
+			delete(p.ensured, key)
+			p.mu.Unlock()
+			if err := rbs.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete rolebinding: %w", err)
+			}
 		}
+		_, err = rbs.Create(ctx, want, metav1.CreateOptions{})
+		if err == nil {
+			p.markEnsured(key, kl, gen, role)
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create rolebinding: %w", err)
+		}
+		createErr = err
 	}
-	if _, err := rbs.Create(ctx, want, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("create rolebinding: %w", err)
+	if existing, err := rbs.Get(ctx, name, metav1.GetOptions{}); err == nil && roleBindingMatches(existing, want) {
+		p.markEnsured(key, kl, gen, role)
+		return nil
 	}
-	p.markEnsured(namespace, userID, role)
-	return nil
+	return fmt.Errorf("create rolebinding: %w", createErr)
 }
 
 // Remove deletes a membership's RoleBinding and ServiceAccount. Deleting the
 // ServiceAccount invalidates every token minted for it immediately.
 func (p *Provisioner) Remove(ctx context.Context, namespace string, userID int64) error {
 	name := accountName(userID)
+	key := membershipKey(namespace, userID)
+	kl, unlock, err := p.acquireKey(ctx, key, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Clear again after acquiring the key lock in case a queued operation
+	// ran between acquireKey's initial invalidation and lock handoff.
 	p.mu.Lock()
-	delete(p.tokens, namespace+"/"+name)
-	delete(p.ensured, namespace+"/"+name)
+	delete(p.tokens, key)
+	delete(p.ensured, key)
+	kl.gen++
 	p.mu.Unlock()
+
 	if err := p.client.RbacV1().RoleBindings(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -210,9 +352,7 @@ func (p *Provisioner) UserConfig(ctx context.Context, namespace string, userID i
 	token, err := p.token(ctx, namespace, userID)
 	if apierrors.IsNotFound(err) {
 		// Deleted out of band after Ensure ran; recreate and retry once.
-		p.mu.Lock()
-		delete(p.ensured, namespace+"/"+accountName(userID))
-		p.mu.Unlock()
+		p.InvalidateToken(namespace, userID)
 		if err := p.Ensure(ctx, namespace, userID, username, role); err != nil {
 			return nil, err
 		}
@@ -223,18 +363,42 @@ func (p *Provisioner) UserConfig(ctx context.Context, namespace string, userID i
 	}
 	cfg := rest.AnonymousClientConfig(p.base)
 	cfg.BearerToken = token
+	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return &unauthorizedInvalidatingTransport{
+			base: rt,
+			on401: func() {
+				p.invalidateTokenIf(namespace, userID, token)
+			},
+		}
+	})
 	return cfg, nil
 }
 
 func (p *Provisioner) token(ctx context.Context, namespace string, userID int64) (string, error) {
 	name := accountName(userID)
-	key := namespace + "/" + name
+	key := membershipKey(namespace, userID)
+
 	p.mu.Lock()
-	c, ok := p.tokens[key]
-	p.mu.Unlock()
-	if ok && time.Until(c.expires) > tokenRefresh {
+	if c, ok := p.tokens[key]; ok && time.Until(c.expires) > tokenRefresh {
+		p.mu.Unlock()
 		return c.token, nil
 	}
+	p.mu.Unlock()
+
+	kl, unlock, err := p.acquireKey(ctx, key, false)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+
+	p.mu.Lock()
+	if c, ok := p.tokens[key]; ok && time.Until(c.expires) > tokenRefresh {
+		p.mu.Unlock()
+		return c.token, nil
+	}
+	gen := kl.gen
+	p.mu.Unlock()
+
 	ttl := int64(tokenTTL.Seconds())
 	tr, err := p.client.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, name,
 		&authv1.TokenRequest{Spec: authv1.TokenRequestSpec{ExpirationSeconds: &ttl}}, metav1.CreateOptions{})
@@ -242,7 +406,33 @@ func (p *Provisioner) token(ctx context.Context, namespace string, userID int64)
 		return "", err
 	}
 	p.mu.Lock()
-	p.tokens[key] = cachedToken{token: tr.Status.Token, expires: tr.Status.ExpirationTimestamp.Time}
+	if kl.gen == gen {
+		p.tokens[key] = cachedToken{token: tr.Status.Token, expires: tr.Status.ExpirationTimestamp.Time}
+	}
 	p.mu.Unlock()
 	return tr.Status.Token, nil
+}
+
+// unauthorizedInvalidatingTransport invalidates a cached ServiceAccount token
+// when the apiserver rejects it with 401 Unauthorized (e.g. after an
+// out-of-band ServiceAccount deletion) so the next request self-heals
+// immediately instead of waiting for cache expiry.
+type unauthorizedInvalidatingTransport struct {
+	base  http.RoundTripper
+	on401 func()
+}
+
+func (t *unauthorizedInvalidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+		t.on401()
+	}
+	return resp, err
+}
+
+// WrappedRoundTripper satisfies k8s.io/apimachinery/pkg/util/net.RoundTripperWrapper
+// so client-go can unwrap the underlying transport (for upgrades, idle
+// connection closing, etc.).
+func (t *unauthorizedInvalidatingTransport) WrappedRoundTripper() http.RoundTripper {
+	return t.base
 }

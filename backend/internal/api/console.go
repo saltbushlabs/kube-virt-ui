@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"kvui/internal/auth"
 	"kvui/internal/vm"
@@ -54,6 +55,11 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 	// running) reach the browser as ordinary HTTP errors.
 	upstream, err := vm.DialConsole(r.Context(), c.cfg, c.namespace, name, kind)
 	if err != nil {
+		// DialConsole uses gorilla/websocket rather than c.cfg's HTTP
+		// transport, so invalidate the cached token here on 401 as well.
+		if apierrors.IsUnauthorized(err) {
+			s.Tenants.InvalidateToken(c.namespace, currentUser(r).ID)
+		}
 		kubeError(w, r, err)
 		return
 	}

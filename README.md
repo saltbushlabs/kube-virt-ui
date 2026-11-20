@@ -171,6 +171,16 @@ helm template kvui deploy/helm/kubevirt-ui -n kubevirt-ui \
   --set existingSecret=kvui-secret
 ```
 
+If you are migrating an existing `helm install` release to GitOps, copy
+`secret-key` from the chart-generated `<release>-key` Secret into a separately
+named Secret (such as `kvui-secret`) rather than pointing `existingSecret` at
+`<release>-key`. Once `existingSecret` is set, the chart stops rendering
+`<release>-key`; ArgoCD with auto-prune does not treat
+`helm.sh/resource-policy: keep` as a prune guard and could delete the
+now-untracked Secret (the chart also sets
+`argocd.argoproj.io/sync-options: Prune=false,Delete=false` on `<release>-key`
+as defence in depth).
+
 ## Tenant namespaces
 
 The chart does not know your tenant namespaces, so it cannot create their

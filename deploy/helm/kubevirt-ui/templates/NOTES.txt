@@ -23,8 +23,16 @@ stored TOTP secrets undecryptable and permanently locks users out of login.
 IMPORTANT for GitOps (ArgoCD, Flux) and `helm template`:
 `existingSecret` is REQUIRED when deploying via GitOps or `helm template`.
 Helm's `lookup` function always returns empty during template rendering, so
-every render/sync would rotate `secret-key` and overwrite the Secret. Before
-switching to GitOps or `helm template`, manage the Secret out-of-band and set:
+every render/sync would rotate `secret-key` and overwrite the Secret.
 
-  --set existingSecret={{ include "kvui.secretName" . }}
+Before switching an existing release to GitOps or `helm template`, copy
+`secret-key` from "{{ include "kvui.secretName" . }}" into a separately named
+Secret managed out-of-band (for example `kvui-secret`) and point
+`existingSecret` at that new Secret rather than reusing
+"{{ include "kvui.secretName" . }}". Once `existingSecret` is set, the chart
+stops rendering "{{ include "kvui.secretName" . }}", and GitOps controllers
+with auto-prune (such as ArgoCD) do not treat `helm.sh/resource-policy: keep`
+as a prune guard:
+
+  --set existingSecret=kvui-secret
 {{- end }}

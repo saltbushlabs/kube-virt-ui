@@ -202,7 +202,6 @@ export function InvitePage() {
 
   return (
     <AuthCard title="Save your recovery codes">
-      {error && <Alert variant="danger" isInline title={error} style={{ marginBottom: 16 }} />}
       <Alert variant="warning" isInline title="These codes are shown only once">
         Each code can be used once instead of an authenticator code if you lose your device. Store them somewhere safe.
       </Alert>
@@ -216,15 +215,11 @@ export function InvitePage() {
       </ClipboardCopy>
       <Button
         isBlock
-        isLoading={busy}
-        isDisabled={busy}
         style={{ marginTop: 16 }}
-        onClick={() =>
-          run(async () => {
-            await refresh()
-            navigate('/')
-          })
-        }
+        onClick={async () => {
+          await refresh()
+          navigate('/')
+        }}
       >
         I have saved them
       </Button>
